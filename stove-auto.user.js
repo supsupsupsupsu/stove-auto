@@ -116,6 +116,38 @@
   ];
 
   /**
+   * 미션 버튼 문구 사전.
+   *
+   * 추측이 아니라 사이트 i18n 번들(_nuxt/D8HRc0Qn.js)의
+   * `flakeshop.mission.button.*` 키에서 그대로 확인한 값이다.
+   *
+   *   go_to_mission        "미션하기"
+   *   receive              "받기"                          ← 수령 가능
+   *   receive_reward       "{count} 플레이크 받기"          ← 수령 가능 (금액 표시형)
+   *   receive_complete     "받기 완료"                      ← 이미 수령
+   *   join_survey          "설문 참여하고 {count} 플레이크 받기"
+   *   see_more_achievement "업적 자세히 보기"
+   *
+   * 뱃지(flakeshop.mission.badge.*): "도전 중" / "달성 완료" / "미션 완료" / "최고 단계"
+   *
+   * 즉 데일리·위클리를 포함한 모든 미션의 수령 버튼은 `받기` 또는 `N 플레이크 받기` 둘 뿐이고,
+   * 끝이 `완료` 면 이미 받은 것이다.
+   */
+  const SURVEY_HEADING = '설문조사 참여하고 플레이크 받기!';
+
+  const MISSION_BUTTON = {
+    goToMission: '미션하기',
+    receive: '받기',
+    receiveComplete: '받기 완료',
+    seeAchievement: '업적 자세히 보기',
+
+    // squash(공백 제거) 기준 패턴
+    receiveRewardRe: /^[\d,]*플레이크받기$/,
+    joinSurveyRe: /^설문참여하고[\d,]*플레이크받기$/,
+    percentRe: /\d(\.\d+)?%$/,
+  };
+
+  /**
    * 캡슐 누적 보상.
    *
    * 주의: 수령을 마치면 버튼 문구에서 금액이 사라지고 그냥 '플레이크 받기 완료' 가 된다.
@@ -863,12 +895,32 @@
       return '⬜';
     };
 
+    // 뽑기 손익: 보상 문구 합계(파싱)와 잔액 실측을 함께 보여준다.
+    const signed = n => `${n >= 0 ? '+' : ''}${n.toLocaleString()}`;
+
+    const drawProfitRow =
+      state.drawsCompleted
+        ? `<div>🎰 뽑기 정산:
+             <strong>+${(state.drawFlakeGained || 0).toLocaleString()}</strong>
+             / <strong>-${(state.drawFlakeSpent || 0).toLocaleString()}</strong>
+             ${
+               state.drawBalanceChange != null
+                 ? `<span style="opacity:.7">(잔액 ${signed(state.drawBalanceChange)})</span>`
+                 : ''
+             }
+           </div>`
+        : '';
+
     // 값이 실제로 바뀌었을 때만 다시 그린다. (기존: 1초마다 무조건 innerHTML 재구성)
     const signature = JSON.stringify([
       state.active,
       phase,
       state.drawCost,
       state.drawsCompleted,
+      state.drawExhausted,
+      state.drawFlakeGained,
+      state.drawFlakeSpent,
+      state.drawBalanceChange,
       state.error,
       currentFlake,
       progress,
@@ -936,8 +988,13 @@
       <div style="background:rgba(255,255,255,.07);padding:9px 10px;border-radius:9px;margin-bottom:10px">
         <div>📍 현재 단계: <strong>${escapeHtml(PHASE_LABEL[phase] || phase)}</strong></div>
         <div>🎯 선택: <strong>${state.drawCost ? `${state.drawCost.toLocaleString()} 뽑기` : '-'}</strong></div>
-        <div>🔢 뽑기: <strong>${state.drawsCompleted || 0} / ${CFG.DRAW_COUNT}</strong></div>
+        <div>🔢 뽑기: <strong>${
+          state.drawExhausted
+            ? `☑️ 오늘 소진 완료${state.drawsCompleted ? ` (이번 실행 ${state.drawsCompleted}회)` : ' (건너뜀)'}`
+            : `${state.drawsCompleted || 0} / ${CFG.DRAW_COUNT}`
+        }</strong></div>
         <div>📒 오늘 누적 뽑기: <strong>${ledger.total}회</strong></div>
+        ${drawProfitRow}
         ${
           currentFlake !== null
             ? `<div>💰 현재 플레이크: <strong>${currentFlake.toLocaleString()}</strong></div>`
@@ -961,6 +1018,11 @@
         <div>　└ 보상 받기: ${daily2.rewardCount || 0}개</div>
         <div>🔗 방문 미션: ${visitSummary}</div>
         <div>📰 인기 게시글: ${popularSummary}</div>
+        <div>🗳️ 설문조사: ${
+          progress.survey === 'done'
+            ? '✅ 참여 완료 (무작위 선택)'
+            : resultText(progress.survey)
+        }</div>
         <div>
           ✍️ 글쓰기: ${loungeIcon(lounge.post)}
           💬 댓글: ${loungeIcon(lounge.comment)}
@@ -1104,7 +1166,14 @@
 
     const ledger = getLedger();
 
-    if (ledger.total > 0 && button.dataset.confirm !== '1') {
+    // 오늘 몫을 이미 소진했다면 어차피 뽑기를 건너뛰므로 확인 절차를 묻지 않는다.
+    const exhausted = isDailyDrawExhausted();
+
+    if (exhausted) {
+      logStatus('☑️ 오늘 뽑기가 이미 완료된 상태입니다. 나머지 단계만 진행합니다.');
+    }
+
+    if (!exhausted && ledger.total > 0 && button.dataset.confirm !== '1') {
       button.dataset.confirm = '1';
       button.textContent = `⚠️ 오늘 ${ledger.total}회 기록 · 그래도 진행`;
 
@@ -1206,6 +1275,18 @@
     return isVisible(span) ? span : null;
   }
 
+  /**
+   * 뽑기 보상 문구에서 플레이크 액수를 뽑아낸다.
+   * 예) "1,000 플레이크" → 1000 / "○○ 쿠폰" → 0
+   */
+  function parseRewardFlake(text) {
+    const matched = String(text || '').match(/([\d,]+)\s*플레이크/);
+    if (!matched) return 0;
+
+    const num = parseInt(matched[1].replace(/,/g, ''), 10);
+    return Number.isNaN(num) ? 0 : num;
+  }
+
   /** 현재 화면의 "뽑기 결과 지문". 팝업 노드/텍스트/잔액 3가지를 함께 본다. */
   function drawSignature() {
     const popup = document.querySelector(SEL.rewardPopup);
@@ -1253,33 +1334,141 @@
     return /플레이크가 부족|보유.*부족|잔액이 부족/.test(text);
   }
 
+  /**
+   * 오늘 뽑기 기회를 모두 소진했는지 판정한다.
+   *
+   * 소진하면 이런 팝업이 뜬다.
+   *   "오늘 30회 뽑기 완료!"
+   *   "내일 또 만나요!"
+   *   [확인] [미션 둘러보기]
+   *
+   * 이건 오류가 아니라 정상적인 종료 조건이다.
+   * 여기서 자동화를 멈추면 Daily Shop·미션·라운지가 통째로 안 돌아간다.
+   */
+  function isDailyDrawExhausted() {
+    const text = normalize(document.body?.innerText || '');
+
+    if (/오늘\s*\d+회\s*뽑기\s*완료/.test(text)) return true;
+    if (/내일\s*또\s*만나요/.test(text)) return true;
+
+    // 이 팝업에만 등장하는 버튼
+    return Boolean(findButtonExact('미션 둘러보기'));
+  }
+
+  /** 소진 팝업을 닫는다. '미션 둘러보기'는 페이지를 옮기므로 '확인'을 우선한다. */
+  async function dismissDrawExhaustedPopup() {
+    const confirm = findButtonAny(['확인', '닫기', 'OK']);
+
+    if (confirm) {
+      confirm.click();
+      await delay(700);
+      return true;
+    }
+
+    return closeVisiblePopup();
+  }
+
+  /** 뽑기 단계를 마무리하고 다음 단계로 넘긴다. (성공·스킵·중단 모두 이 경로) */
+  async function finishDrawPhase({ cost, completed, exhausted, stopReason, gained = 0 }) {
+    const endFlake = getFlakeCount();
+    const startFlake = getMain().drawStartFlake;
+
+    const spent = cost * completed;
+
+    // 잔액 실측 변화 — 보상 문구 파싱과 별개로 신뢰할 수 있는 값
+    const balanceChange =
+      startFlake != null && endFlake != null ? endFlake - startFlake : null;
+
+    recordRun(cost, completed);
+
+    setMain({
+      phase: 'capsule_rewards',
+      drawEndFlake: endFlake,
+      missionStartFlake: endFlake,
+      drawsCompleted: completed,
+      drawExhausted: Boolean(exhausted),
+      drawStopReason: stopReason || '',
+      drawFlakeGained: gained,
+      drawFlakeSpent: spent,
+      drawBalanceChange: balanceChange,
+    });
+
+    if (completed > 0) {
+      logStatus(
+        `💰 뽑기 정산 — 보상 +${gained.toLocaleString()} / 소모 -${spent.toLocaleString()}` +
+          (balanceChange != null
+            ? ` / 잔액 변화 ${balanceChange >= 0 ? '+' : ''}${balanceChange.toLocaleString()}`
+            : '')
+      );
+    }
+
+    if (exhausted) {
+      toast(
+        completed > 0
+          ? `☑️ 오늘 뽑기 기회를 모두 소진했습니다. (이번 실행 ${completed}회)\n➡️ 다음 단계로 넘어갑니다.`
+          : '☑️ 오늘 뽑기는 이미 모두 완료된 상태입니다.\n➡️ 뽑기를 건너뛰고 다음 단계로 넘어갑니다.',
+        9000
+      );
+    } else {
+      toast(
+        `✅ 뽑기 ${completed}/${CFG.DRAW_COUNT}회 완료\n➡️ 캡슐 누적 보상을 확인합니다.`,
+        9000
+      );
+    }
+
+    await delay(1200);
+
+    // 팝업이 남아 있으면 이후 단계의 버튼 탐색을 방해하므로 새로고침 후 진행한다.
+    navigate(getMain().rewardUrl || REWARD_URL, 'capsule_rewards', { reloadIfSame: true });
+  }
+
   async function runDrawLoop(cost) {
     const startFlake = getFlakeCount();
-
-    if (startFlake === null) {
-      throw new Error('플레이크 보유량 표시를 찾지 못했습니다. 로그인 상태와 페이지를 확인해 주세요.');
-    }
 
     setMain({
       phase: 'draw_running',
       drawCost: cost,
       drawStartFlake: startFlake,
       drawsCompleted: 0,
+      drawExhausted: false,
     });
+
+    // --- 시작 전 점검: 오늘 몫을 이미 다 돌린 경우 ---
+    if (isDailyDrawExhausted()) {
+      logStatus('☑️ 오늘 30회 뽑기를 이미 모두 소진한 상태입니다. 뽑기를 건너뜁니다.');
+
+      await dismissDrawExhaustedPopup();
+      await finishDrawPhase({ cost, completed: 0, exhausted: true });
+
+      return;
+    }
+
+    if (startFlake === null) {
+      logStatus('⚠️ 플레이크 보유량 표시를 찾지 못했습니다. 뽑기 결과 검증 정확도가 떨어질 수 있습니다.');
+    }
 
     toast(`🎯 ${cost.toLocaleString()} 뽑기 ${CFG.DRAW_COUNT}회를 시작합니다.`, 10000);
 
     let completed = 0;
+    let exhausted = false;
     let stopReason = '';
+    let gained = 0;
 
     for (let drawNo = 1; drawNo <= CFG.DRAW_COUNT; drawNo++) {
       const isFirst = drawNo === 1;
 
       const button = await waitFor(
-        () => (isFirst ? findInitialDrawButton(cost) : findRepeatDrawButton(cost)),
+        () =>
+          isDailyDrawExhausted() ||
+          (isFirst ? findInitialDrawButton(cost) : findRepeatDrawButton(cost)),
         isFirst ? 12000 : 8000,
         200
       );
+
+      if (isDailyDrawExhausted()) {
+        exhausted = true;
+        break;
+      }
 
       if (!button) {
         stopReason = isFirst
@@ -1296,12 +1485,18 @@
           ? findInitialDrawButton(cost) || button
           : findRepeatDrawButton(cost) || button;
 
-        if (!target) break;
+        if (!target || typeof target.click !== 'function') break;
 
         target.click();
 
         result = await waitForDrawResult(before);
         if (result.ok) break;
+
+        // 결과가 안 잡히면 먼저 "소진"인지부터 본다. (오류로 오인하면 안 됨)
+        if (isDailyDrawExhausted()) {
+          exhausted = true;
+          break;
+        }
 
         if (hasInsufficientFlakeMessage()) {
           stopReason = '플레이크가 부족해 뽑기를 중단합니다.';
@@ -1315,7 +1510,7 @@
         await delay(random(900, 1400));
       }
 
-      if (stopReason) break;
+      if (exhausted || stopReason) break;
 
       if (!result?.ok) {
         stopReason = `${drawNo}회차 뽑기 결과를 확인하지 못했습니다. 중복 소모를 막기 위해 중단합니다.`;
@@ -1324,43 +1519,49 @@
 
       completed = drawNo;
 
+      const reward = parseRewardFlake(result.text);
+      gained += reward;
+
       recordDraw(cost);
-      setMain({ drawsCompleted: completed });
+
+      setMain({
+        drawsCompleted: completed,
+        drawFlakeGained: gained,
+        drawFlakeSpent: cost * completed,
+      });
 
       logStatus(
         result.text
-          ? `🎁 ${drawNo}/${CFG.DRAW_COUNT}회차 보상: ${result.text} (확인:${result.via})`
+          ? `🎁 ${drawNo}/${CFG.DRAW_COUNT}회차 보상: ${result.text}` +
+              (reward ? ` (+${reward.toLocaleString()})` : '') +
+              ` (확인:${result.via})`
           : `🎁 ${drawNo}/${CFG.DRAW_COUNT}회차 완료 (확인:${result.via})`
       );
 
       if (drawNo < CFG.DRAW_COUNT) {
         await delay(random(2400, 3000));
+
+        // 마지막 회차 직후에도 소진 팝업이 뜬다.
+        if (isDailyDrawExhausted()) {
+          exhausted = true;
+          break;
+        }
       }
     }
 
-    if (stopReason) logStatus(`⚠️ ${stopReason}`);
+    if (exhausted) {
+      logStatus(
+        completed > 0
+          ? `☑️ 오늘 뽑기 기회를 모두 소진했습니다. (이번 실행 ${completed}회) 다음 단계로 넘어갑니다.`
+          : '☑️ 오늘 뽑기는 이미 완료된 상태였습니다. 다음 단계로 넘어갑니다.'
+      );
 
-    const endFlake = getFlakeCount();
+      await dismissDrawExhaustedPopup();
+    } else if (stopReason) {
+      logStatus(`⚠️ ${stopReason}`);
+    }
 
-    recordRun(cost, completed);
-
-    setMain({
-      phase: 'capsule_rewards',
-      drawEndFlake: endFlake,
-      missionStartFlake: endFlake,
-      drawsCompleted: completed,
-      drawStopReason: stopReason || '',
-    });
-
-    toast(
-      `✅ 뽑기 ${completed}/${CFG.DRAW_COUNT}회 완료\n➡️ 캡슐 누적 보상을 확인합니다.`,
-      9000
-    );
-
-    await delay(1200);
-
-    // 뽑기 팝업이 남아 있으면 이후 단계의 버튼 탐색을 방해하므로 새로고침 후 진행한다.
-    navigate(getMain().rewardUrl || REWARD_URL, 'capsule_rewards', { reloadIfSame: true });
+    await finishDrawPhase({ cost, completed, exhausted, stopReason, gained });
   }
 
   // ===========================================================================
@@ -1666,11 +1867,42 @@
     }
   }
 
+  /**
+   * 미션 버튼을 i18n 사전 기준으로 분류한다.
+   * 반환: receive | receive_complete | go_to_mission | join_survey | see_achievement | other
+   */
+  function classifyMissionButton(button) {
+    const text = squash(button.innerText);
+
+    if (!text) return 'other';
+
+    // '받기 완료', '100 플레이크 받기 완료' 등 — 끝이 완료면 무조건 수령 끝
+    if (/완료$/.test(text)) return 'receive_complete';
+
+    if (MISSION_BUTTON.joinSurveyRe.test(text)) return 'join_survey';
+    if (text === squash(MISSION_BUTTON.receive)) return 'receive';
+    if (MISSION_BUTTON.receiveRewardRe.test(text)) return 'receive';
+    if (text === squash(MISSION_BUTTON.goToMission)) return 'go_to_mission';
+    if (text === squash(MISSION_BUTTON.seeAchievement)) return 'see_achievement';
+
+    return 'other';
+  }
+
+  /** 지금 누를 수 있는 수령 버튼 하나 (데일리·위클리·설문·인기글 모두 포함) */
+  function findClaimableRewardButton(root = document) {
+    return (
+      [...root.querySelectorAll('button')].find(
+        btn =>
+          !btn.disabled && isVisible(btn) && classifyMissionButton(btn) === 'receive'
+      ) || null
+    );
+  }
+
   async function collectAllAvailableRewards(maxClicks = 60) {
     let total = 0;
 
     for (let i = 0; i < maxClicks; i++) {
-      const button = findButtonExact('받기');
+      const button = findClaimableRewardButton();
       if (!button) break;
 
       await clickWithScroll(button);
@@ -1841,16 +2073,109 @@
     return collectPopular();
   }
 
-  /** 미션 카드 버튼 문구 → 상태 */
+  // =========================================================================
+  // 설문조사 참여하고 플레이크 받기
+  // =========================================================================
+
+  function surveySection() {
+    const heading = findLeafByText(SURVEY_HEADING);
+    if (!heading) return null;
+
+    let section = heading;
+
+    for (let i = 0; i < 8 && section; i++) {
+      section = section.parentElement;
+
+      if (section && section.querySelectorAll('button').length >= 2) return section;
+    }
+
+    return null;
+  }
+
+  /**
+   * 이미 투표했는지 판정.
+   * 투표를 마치면 선택지 버튼에 득표율(41.41%)이 붙고, 수령/완료 버튼이 생긴다.
+   */
+  function surveyAlreadyVoted(section) {
+    const buttons = [...section.querySelectorAll('button')];
+
+    if (buttons.some(btn => MISSION_BUTTON.percentRe.test(squash(btn.innerText)))) return true;
+
+    return buttons.some(btn => classifyMissionButton(btn) === 'receive_complete');
+  }
+
+  /** 선택지 버튼들 (수령/완료/설문참여 버튼은 제외) */
+  function surveyChoices(section) {
+    return [...section.querySelectorAll('button')].filter(btn => {
+      if (btn.disabled || !isVisible(btn)) return false;
+      if (classifyMissionButton(btn) !== 'other') return false;
+
+      return squash(btn.innerText).length > 0;
+    });
+  }
+
+  /**
+   * 설문조사 자동 참여.
+   * 선택지는 무작위로 고른다 (항상 1번만 찍어 집계를 왜곡하지 않기 위함).
+   * 수령 버튼은 이후 collectAllAvailableRewards 가 일괄 처리한다.
+   */
+  async function runSurvey() {
+    const section = surveySection();
+
+    if (!section) {
+      patchProgress({ survey: 'none' });
+      logStatus('⏭️ 설문조사 섹션이 없습니다.');
+      return 'none';
+    }
+
+    if (surveyAlreadyVoted(section)) {
+      patchProgress({ survey: 'already' });
+      logStatus('☑️ 설문조사는 이미 참여한 상태입니다.');
+      return 'already';
+    }
+
+    // '설문 참여하고 N 플레이크 받기' 가 먼저 뜨는 경우 선택지를 펼친다.
+    const opener = [...section.querySelectorAll('button')].find(
+      btn => classifyMissionButton(btn) === 'join_survey' && !btn.disabled
+    );
+
+    if (opener) {
+      await clickWithScroll(opener);
+      await delay(1500);
+    }
+
+    const choices = surveyChoices(surveySection() || section);
+
+    if (!choices.length) {
+      patchProgress({ survey: 'none' });
+      logStatus('⏭️ 설문조사 선택지를 찾지 못했습니다.');
+      return 'none';
+    }
+
+    const picked = choices[random(0, choices.length - 1)];
+    const pickedText = normalize(picked.innerText).slice(0, 40);
+
+    await clickWithScroll(picked);
+    logStatus(`🗳️ 설문조사 참여 (무작위 선택): ${pickedText}`);
+
+    await delay(1800);
+    await closeVisiblePopup();
+
+    patchProgress({ survey: 'done' });
+    return 'done';
+  }
+
+  /** 미션 카드 버튼 문구 → 상태 (i18n 사전 기준) */
   function missionStateOf(title) {
     const button = findMissionButton(title);
     if (!button) return { state: 'none', label: '' };
 
     const label = squash(button.innerText);
+    const kind = classifyMissionButton(button);
 
-    if (label === '미션하기') return { state: 'todo', label, button };
-    if (label === '받기') return { state: 'claimable', label, button };
-    if (/완료$/.test(label)) return { state: 'already', label, button };
+    if (kind === 'go_to_mission') return { state: 'todo', label, button };
+    if (kind === 'receive') return { state: 'claimable', label, button };
+    if (kind === 'receive_complete') return { state: 'already', label, button };
 
     return { state: 'unknown', label, button };
   }
@@ -1910,6 +2235,11 @@
 
     // runPopular() 내부에서 이미 collectPopular() 를 호출한다. (중복 호출 제거)
     await runPopular();
+
+    // 설문 참여 → 수령 버튼이 활성화되면 아래 일괄 수령에서 처리된다.
+    await runSurvey();
+
+    await refreshMissionList();
     await collectAllAvailableRewards();
 
     if (!loungeMissionLeft().length) {
@@ -2183,7 +2513,13 @@
     toast(
       [
         '✅ 전체 자동화 완료',
-        `🎯 뽑기: ${(current.drawCost || 0).toLocaleString()} × ${current.drawsCompleted || 0}/${CFG.DRAW_COUNT}회`,
+        current.drawExhausted && !current.drawsCompleted
+          ? '☑️ 뽑기: 오늘 이미 완료되어 건너뜀'
+          : `🎯 뽑기: ${(current.drawCost || 0).toLocaleString()} × ${current.drawsCompleted || 0}회` +
+            (current.drawExhausted ? ' (오늘 소진 완료)' : `/${CFG.DRAW_COUNT}회`),
+        current.drawsCompleted
+          ? `🎰 뽑기 정산: 보상 +${(current.drawFlakeGained || 0).toLocaleString()} / 소모 -${(current.drawFlakeSpent || 0).toLocaleString()}`
+          : '',
         current.drawStopReason ? `⚠️ ${current.drawStopReason}` : '',
         finalFlake != null ? `▶️ 최종 플레이크: ${finalFlake.toLocaleString()}` : '',
         overallChange != null ? `📊 시작 대비 변화: ${overallChange.toLocaleString()}` : '',
