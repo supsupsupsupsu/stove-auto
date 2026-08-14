@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STOVE 플레이크 전체 자동화 + 상태 패널
 // @namespace    https://github.com/supsupsupsupsu/stove-auto
-// @version      0.4.0
+// @version      0.5.0
 // @description  캡슐 뽑기 → 캡슐 누적 보상 → Daily Shop → 미션 → 인기 게시글 → 라운지 → 보상 수령을 자동 처리합니다. (뽑기 성공 검증 / 단계 워치독 / 자동 복구 포함)
 // @homepageURL  https://github.com/supsupsupsupsu/stove-auto
 // @supportURL   https://github.com/supsupsupsupsu/stove-auto/issues
@@ -20,6 +20,11 @@
 
 /* =============================================================================
  * 변경 이력
+ *
+ * 0.5.0  완료 시 뜨던 요약 토스트 제거 (패널에 같은 내용이 이미 있어 화면만 가림).
+ *        '오늘 획득' 표시 추가 — 사이트는 '이번 달 획득'만 제공하므로
+ *        오늘 최초 관찰 잔액을 기준선으로 잡아 직접 계산한다.
+ *        획득 = 잔액 순증감 + 오늘 뽑기 소모(원장 기준).
  *
  * 0.4.0  설문조사 자동 참여(무작위 선택) 추가.
  *        사이트 i18n 번들(flakeshop.mission.button.*)에서 확인한 문구로
@@ -207,6 +212,8 @@
    */
   const squash = text => normalize(text).replace(/\s/g, '');
 
+  const signedNumber = n => `${n >= 0 ? '+' : ''}${Number(n).toLocaleString()}`;
+
   const escapeHtml = value =>
     String(value ?? '')
       .replace(/&/g, '&amp;')
@@ -393,10 +400,75 @@
     const today = kstDateKey();
 
     if (!value || typeof value !== 'object' || value.date !== today) {
-      return { date: today, total: 0, byCost: {}, runs: [] };
+      return {
+        date: today,
+        total: 0,
+        byCost: {},
+        runs: [],
+        firstFlake: null,
+        lastFlake: null,
+      };
     }
 
     return value;
+  }
+
+  /**
+   * 오늘의 플레이크 증감을 추적한다.
+   *
+   * 사이트는 '이번 달 획득'만 보여주고 일간 수치는 제공하지 않는다.
+   * 그래서 오늘 처음 관찰한 잔액을 기준선으로 잡고 직접 계산한다.
+   * (기준선은 KST 자정에 자동으로 초기화된다)
+   */
+  function observeFlake() {
+    const flake = getFlakeCount();
+    if (flake === null) return;
+
+    const ledger = getLedger();
+    let changed = false;
+
+    if (ledger.firstFlake == null) {
+      ledger.firstFlake = flake;
+      ledger.firstAt = Date.now();
+      changed = true;
+    }
+
+    if (ledger.lastFlake !== flake) {
+      ledger.lastFlake = flake;
+      changed = true;
+    }
+
+    if (changed) {
+      GM_setValue(KEY.LEDGER, ledger);
+      markPanelDirty();
+    }
+  }
+
+  /**
+   * 오늘 정산.
+   *   spent  — 오늘 뽑기에 쓴 플레이크 (원장 기준, 정확)
+   *   net    — 잔액 순증감 (기준선 대비)
+   *   earned — net + spent  = 실제로 벌어들인 양
+   */
+  function getTodaySummary() {
+    const ledger = getLedger();
+
+    const spent = Object.entries(ledger.byCost || {}).reduce(
+      (sum, [cost, count]) => sum + Number(cost) * Number(count),
+      0
+    );
+
+    const net =
+      ledger.firstFlake != null && ledger.lastFlake != null
+        ? ledger.lastFlake - ledger.firstFlake
+        : null;
+
+    return {
+      spent,
+      net,
+      earned: net == null ? null : net + spent,
+      baseline: ledger.firstFlake,
+    };
   }
 
   function recordDraw(cost) {
@@ -867,9 +939,14 @@
     const logOpen = panel.dataset.logOpen !== '0';
 
     const recentLogs = getStatusLog().slice(logOpen ? -9 : -3);
+
+    // 잔액을 먼저 기록해야 오늘 증감이 최신 값으로 계산된다.
+    observeFlake();
+
     const currentFlake = getFlakeCount();
     const retryRows = getRetryDisplay();
     const ledger = getLedger();
+    const today = getTodaySummary();
 
     const capsule = progress.capsuleRewards || {};
     const daily = progress.dailyShop || {};
@@ -922,7 +999,24 @@
     };
 
     // 뽑기 손익: 보상 문구 합계(파싱)와 잔액 실측을 함께 보여준다.
-    const signed = n => `${n >= 0 ? '+' : ''}${n.toLocaleString()}`;
+    const signed = signedNumber;
+
+    // 오늘 벌어들인 플레이크 (뽑기 소모를 되더한 값)
+    const todayEarnedRow =
+      today.earned == null
+        ? `<div>🪙 오늘 획득: <span style="opacity:.6">측정 중…</span></div>`
+        : `<div>🪙 오늘 획득:
+             <strong style="color:${today.earned >= 0 ? '#8ee6a1' : '#ff9f9a'}">
+               ${signed(today.earned)}
+             </strong>
+             ${
+               today.spent
+                 ? `<span style="opacity:.65;font-size:11px">
+                      (뽑기 -${today.spent.toLocaleString()} · 순증감 ${signed(today.net)})
+                    </span>`
+                 : ''
+             }
+           </div>`;
 
     const drawProfitRow =
       state.drawsCompleted
@@ -954,6 +1048,9 @@
       recentLogs.length,
       recentLogs[recentLogs.length - 1]?.time,
       ledger.total,
+      today.earned,
+      today.spent,
+      today.net,
       logOpen,
     ]);
 
@@ -1020,6 +1117,7 @@
             : `${state.drawsCompleted || 0} / ${CFG.DRAW_COUNT}`
         }</strong></div>
         <div>📒 오늘 누적 뽑기: <strong>${ledger.total}회</strong></div>
+        ${todayEarnedRow}
         ${drawProfitRow}
         ${
           currentFlake !== null
@@ -2531,29 +2629,19 @@
       finishedAt: Date.now(),
     });
 
+    // 완료 요약은 토스트로 띄우지 않는다.
+    // 같은 내용이 상태 패널에 이미 다 있어서 화면만 가렸다.
     logStatus('✅ STOVE 전체 자동화 완료');
 
+    if (current.drawStopReason) logStatus(`⚠️ ${current.drawStopReason}`);
     if (finalFlake != null) logStatus(`💰 최종 플레이크: ${finalFlake.toLocaleString()}`);
-    if (overallChange != null) logStatus(`📊 시작 대비 변화: ${overallChange.toLocaleString()}`);
+    if (overallChange != null) logStatus(`📊 시작 대비 변화: ${signedNumber(overallChange)}`);
 
-    toast(
-      [
-        '✅ 전체 자동화 완료',
-        current.drawExhausted && !current.drawsCompleted
-          ? '☑️ 뽑기: 오늘 이미 완료되어 건너뜀'
-          : `🎯 뽑기: ${(current.drawCost || 0).toLocaleString()} × ${current.drawsCompleted || 0}회` +
-            (current.drawExhausted ? ' (오늘 소진 완료)' : `/${CFG.DRAW_COUNT}회`),
-        current.drawsCompleted
-          ? `🎰 뽑기 정산: 보상 +${(current.drawFlakeGained || 0).toLocaleString()} / 소모 -${(current.drawFlakeSpent || 0).toLocaleString()}`
-          : '',
-        current.drawStopReason ? `⚠️ ${current.drawStopReason}` : '',
-        finalFlake != null ? `▶️ 최종 플레이크: ${finalFlake.toLocaleString()}` : '',
-        overallChange != null ? `📊 시작 대비 변화: ${overallChange.toLocaleString()}` : '',
-      ]
-        .filter(Boolean)
-        .join('\n'),
-      20000
-    );
+    const today = getTodaySummary();
+
+    if (today.earned != null) {
+      logStatus(`🪙 오늘 획득: ${signedNumber(today.earned)} (뽑기 소모 -${today.spent.toLocaleString()})`);
+    }
 
     updateDrawPanel();
     armRetryTimer();
