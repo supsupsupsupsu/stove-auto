@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STOVE 플레이크 전체 자동화 + 상태 패널
 // @namespace    https://github.com/supsupsupsupsu/stove-auto
-// @version      0.6.0
+// @version      0.7.0
 // @description  캡슐 뽑기 → 캡슐 누적 보상 → Daily Shop → 미션 → 인기 게시글 → 라운지 → 보상 수령을 자동 처리합니다. (뽑기 성공 검증 / 단계 워치독 / 자동 복구 포함)
 // @homepageURL  https://github.com/supsupsupsupsu/stove-auto
 // @supportURL   https://github.com/supsupsupsupsu/stove-auto/issues
@@ -10,17 +10,44 @@
 // @match        https://reward.onstove.com/*
 // @match        https://event.onstove.com/ko/dailyshop/*
 // @match        https://lounge.onstove.com/*
+// 아래 두 줄은 "방문 도우미" 전용이다.
+// 방문 미션·인기 게시글이 여는 탭에서 스크립트가 함께 실행되어
+// 잠깐 체류(스크롤)한 뒤 스스로 탭을 닫는다. 자동화가 연 탭이 아니면 아무것도 하지 않는다.
+// @match        https://page.onstove.com/*
+// @match        https://store.onstove.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_deleteValue
 // @grant        GM_openInTab
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
+// @grant        window.close
 // @run-at       document-idle
 // ==/UserScript==
 
 /* =============================================================================
  * 변경 이력
+ *
+ * 0.7.0  [수정] 방문 미션이 연 탭 3개(365일 특가 / MY홈 / 스토브 메인)가 안 닫히던 문제.
+ *          Tampermonkey 는 스크립트를 샌드박스에서 돌린다. 0.6.0 은 샌드박스 쪽
+ *          window.open 만 감쌌기 때문에, 페이지 컨텍스트에서 실행되는 사이트 코드는
+ *          원래 open 을 그대로 썼다. 즉 후킹이 한 번도 걸리지 않아 핸들이 비어 있었다.
+ *          → unsafeWindow.open 까지 함께 감싸고, <a target="_blank"> 클릭도
+ *            캡처 단계에서 가로챈다. 그래도 새는 경우를 위해 열린 탭 쪽에서
+ *            스스로 닫는 "방문 도우미" 를 2중 안전장치로 뒀다.
+ *
+ *        [수정] 뽑기가 30회를 못 채우고 중간에 끊기던 문제.
+ *          0.6.0 은 회차마다 보상 팝업을 먼저 닫아 '부재 → 등장' 신호를 만들었는데,
+ *          '한번 더' 버튼이 바로 그 팝업 안에 있다. 팝업을 닫는 순간 다음 회차의
+ *          진입점이 사라져, 버튼을 못 찾으면 그대로 중단됐다.
+ *          → 팝업을 닫지 않는다. 대신 판정을 '내용'이 아니라 '사건'으로 바꿨다.
+ *            (뽑기 API 호출 관찰 + 팝업 DOM 변형 카운터 + 잔액 + 팝업 등장)
+ *            중단 조건도 누적 3회 → 연속 3회로 완화했다.
+ *
+ *        [추가] '인기 게시글 보고 플레이크 받기!' 수령 로직 재작성.
+ *          카드 단위로 링크·버튼·완료 여부를 함께 읽고, 방문 → 수령 → 반영 대기 →
+ *          미완료 글 재방문까지 라운드로 돌린다. 방문 탭은 도우미가 스크롤하며
+ *          체류한 뒤 스스로 닫아 '읽음' 인정률을 올린다.
  *
  * 0.6.0  [수정] Daily Shop 재시도가 페이지를 무한 새로고침시켜 먹통이 되던 문제.
  *          지난 예약을 armRetryTimer 가 0ms 로 발사 → launchDueRetry 가 같은 주소를
@@ -85,6 +112,10 @@
     RETRY: '__stove_daily_retry_s1',
     LOG: '__stove_auto_status_log_s1',
     LEDGER: '__stove_draw_ledger_s1',
+
+    // 새 탭에서 실행되는 "방문 도우미" 에게 넘기는 지시.
+    // 탭 사이에 공유되어야 하므로 GM storage 를 쓴다.
+    VISIT: '__stove_visit_task_s1',
   };
 
   const CFG = {
@@ -98,9 +129,14 @@
     // 재클릭은 뽑기 1회를 더 소모시키므로 절대 하지 않는다.
     DRAW_GRACE_TIMEOUT: 8000,
 
-    // 결과를 끝내 확인하지 못한 회차가 이 횟수를 넘으면 중단한다.
-    // (1~2회는 팝업 렌더 타이밍 문제일 뿐이라 중단할 이유가 없다)
+    // 결과를 "연속으로" 이만큼 확인하지 못하면 중단한다.
+    // 누적이 아니라 연속인 이유: 30회 중 드문드문 놓치는 건 판정 타이밍 문제일 뿐,
+    // 뽑기 자체는 정상으로 돌아가고 있다. 연속 실패라야 진짜로 멈춘 것이다.
     DRAW_UNVERIFIED_LIMIT: 3,
+
+    // 팝업 DOM 변형만으로 성공을 인정하기 전에 최소한 이만큼은 지나야 한다.
+    // (클릭 직후의 잔여 애니메이션을 결과로 오인하지 않기 위한 하한선)
+    DRAW_MIN_MUTATION_MS: 1200,
 
     // 오늘의 아이템 재시도 간격(4시간) / 당일 최종 시도 시각
     RETRY_INTERVAL_MS: 4 * 60 * 60 * 1000,
@@ -118,7 +154,22 @@
     RETRY_STALE_MS: 10 * 60 * 1000,
 
     // 방문 미션 체류 시간
-    VISIT_WAIT: 4000,
+    VISIT_WAIT: 5000,
+
+    // 방문 탭이 늦게 뜨는 경우를 감안해 "도우미 유효 창"을 이만큼 더 열어둔다.
+    // 이 창이 닫힌 뒤에 열린 탭은 사용자가 직접 연 것으로 보고 건드리지 않는다.
+    VISIT_TAB_GRACE_MS: 15 * 1000,
+
+    // 인기 게시글 1편당 체류 시간 (짧으면 '읽음'으로 인정되지 않는다)
+    POPULAR_VISIT_WAIT: 7000,
+
+    // 수령 버튼이 열릴 때까지 재확인하는 라운드 수와 간격.
+    // 방문 직후 곧바로 열리지 않고 몇 초 뒤 반영되는 경우가 잦다.
+    POPULAR_CLAIM_ROUNDS: 4,
+    POPULAR_CLAIM_DELAY: 3500,
+
+    // 마지막 라운드 전에 미완료 글을 한 번 더 방문할지 여부
+    POPULAR_REVISIT: true,
 
     // 워치독: 이 시간 동안 상태 갱신이 없으면 멈춘 것으로 판단
     STALL_TIMEOUT_MS: 90 * 1000,
@@ -238,6 +289,169 @@
    * 원자료를 그대로 담아둔다. 콘솔에서 __stoveDiag.dump() 로 꺼내 공유하면 된다.
    */
   const DIAG = { draw: [], popular: [], survey: [] };
+
+  /**
+   * 관찰기.
+   *
+   * "뽑기 1회가 실제로 일어났는가" 를 팝업 문구 비교로 판정하면 안 된다.
+   * 같은 보상이 연속으로 나오는 순간 노드도 텍스트도 그대로라, 멀쩡히 뽑힌 회차를
+   * 실패로 오판한다. 0.6.0 은 이걸 피하려고 회차마다 팝업을 닫았는데,
+   * 하필 '한번 더' 버튼이 그 팝업 안에 있어 다음 회차의 진입점을 스스로 없앴다.
+   *
+   * 그래서 판정을 '내용' 이 아니라 '사건' 으로 바꾼다.
+   *   apiEvents      — 사이트가 보낸 비-GET 요청 (뽑기 요청은 반드시 여기 잡힌다)
+   *   popupMutations — 보상 팝업 내부가 다시 그려진 횟수 (문구가 같아도 잡힌다)
+   *   popupAppears   — 팝업이 '없음 → 있음' 으로 바뀐 횟수
+   */
+  const PROBE = {
+    apiEvents: [],
+    popupMutations: 0,
+    popupAppears: 0,
+    drawApiHint: '',
+  };
+
+  function noteApiEvent(method, url) {
+    const verb = String(method || 'GET').toUpperCase();
+
+    // 조회성 요청은 세지 않는다. 뽑기는 반드시 서버 상태를 바꾸는 요청이다.
+    if (verb === 'GET' || verb === 'HEAD' || verb === 'OPTIONS') return;
+
+    const clean = String(url || '').split('?')[0];
+
+    if (!clean) return;
+    if (/analytics|gtag|gtm|sentry|beacon|collect|tracking/i.test(clean)) return;
+
+    PROBE.apiEvents.push({ at: Date.now(), verb, url: clean });
+
+    while (PROBE.apiEvents.length > 60) PROBE.apiEvents.shift();
+  }
+
+  function apiEventsAfter(since, hint = '') {
+    return PROBE.apiEvents.filter(
+      event => event.at >= since && (!hint || event.url.includes(hint))
+    );
+  }
+
+  /**
+   * fetch / XMLHttpRequest 를 감싸 요청 완료 시각만 기록한다. (본문은 건드리지 않는다)
+   *
+   * 반드시 unsafeWindow 기준으로 감싸야 한다.
+   * Tampermonkey 는 스크립트를 샌드박스에서 돌리므로, 샌드박스의 fetch 를 바꿔봐야
+   * 사이트 코드는 페이지 컨텍스트의 원본을 그대로 쓴다. (0.6.0 탭 후킹이 무력했던 이유와 같다)
+   */
+  function installNetworkProbe() {
+    const host =
+      typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window;
+
+    if (host.__stoveNetProbe) return;
+    host.__stoveNetProbe = true;
+
+    try {
+      const nativeFetch = host.fetch;
+
+      if (typeof nativeFetch === 'function') {
+        host.fetch = function (input, init) {
+          const url = typeof input === 'string' ? input : input?.url || '';
+          const verb = init?.method || input?.method || 'GET';
+
+          const note = () => {
+            try {
+              noteApiEvent(verb, url);
+            } catch (_) {
+              /* 관찰 실패가 본 기능을 막으면 안 된다 */
+            }
+          };
+
+          return nativeFetch.apply(this, arguments).then(
+            response => {
+              note();
+              return response;
+            },
+            error => {
+              note();
+              throw error;
+            }
+          );
+        };
+      }
+    } catch (error) {
+      console.warn('[stove] fetch 관찰기 설치 실패', error);
+    }
+
+    try {
+      const XHR = host.XMLHttpRequest;
+      const nativeOpen = XHR.prototype.open;
+      const nativeSend = XHR.prototype.send;
+
+      XHR.prototype.open = function (method, url) {
+        this.__stoveVerb = method;
+        this.__stoveUrl = url;
+
+        return nativeOpen.apply(this, arguments);
+      };
+
+      XHR.prototype.send = function () {
+        try {
+          this.addEventListener(
+            'loadend',
+            () => noteApiEvent(this.__stoveVerb, this.__stoveUrl),
+            { once: true }
+          );
+        } catch (_) {
+          /* 무시 */
+        }
+
+        return nativeSend.apply(this, arguments);
+      };
+    } catch (error) {
+      console.warn('[stove] XHR 관찰기 설치 실패', error);
+    }
+  }
+
+  /** 보상 팝업의 등장/재렌더 횟수를 센다. */
+  function installPopupProbe() {
+    if (window.__stovePopupProbe) return;
+    window.__stovePopupProbe = true;
+
+    let hadPopup = Boolean(document.querySelector(SEL.rewardPopup));
+
+    const observer = new MutationObserver(records => {
+      const popup = document.querySelector(SEL.rewardPopup);
+
+      if (popup && !hadPopup) PROBE.popupAppears++;
+      hadPopup = Boolean(popup);
+
+      if (!popup) return;
+
+      for (const record of records) {
+        const inside = record.target && popup.contains(record.target);
+
+        const replaced = [...record.addedNodes].some(
+          node => node === popup || (node.contains && node.contains(popup))
+        );
+
+        if (inside || replaced) {
+          PROBE.popupMutations++;
+          break;
+        }
+      }
+    });
+
+    const start = () => {
+      if (!document.body) {
+        setTimeout(start, 300);
+        return;
+      }
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+    };
+
+    start();
+  }
 
   const random = (min, max) =>
     Math.floor(Math.random() * (max - min + 1)) + min;
@@ -1064,15 +1278,17 @@
       : '⬜ 대기';
 
     const popularTotalCount = progress.popularTotal || 3;
+    const popularDone = progress.popularVisited || 0;
+    const popularClaimed = progress.popularClaimed || 0;
 
-    const popularSummary =
-      progress.popularState === 'already'
-        ? `☑️ ${popularTotalCount}개 모두 이미 완료`
-        : progress.popularState === 'none'
-          ? '⏭️ 대상 없음'
-          : progress.popularVisited
-            ? `✅ ${progress.popularVisited}/${popularTotalCount}개 방문`
-            : '⬜ 대기';
+    const popularSummary = !progress.popularState
+      ? '⬜ 대기'
+      : progress.popularState === 'none'
+        ? '⏭️ 대상 없음'
+        : progress.popularState === 'running'
+          ? `⏳ ${popularTotalCount}개 처리 중`
+          : `${popularDone >= popularTotalCount ? '✅' : '⚠️'} ${popularDone}/${popularTotalCount}개 완료` +
+            (popularClaimed ? ` (이번 실행 ${popularClaimed}개 수령)` : '');
 
     // lounge 값은 done | already | true(구버전) | false
     const loungeIcon = value => {
@@ -1494,39 +1710,88 @@
     return Number.isNaN(num) ? 0 : num;
   }
 
-  /** 현재 화면의 "뽑기 결과 지문". 팝업 노드/텍스트/잔액 3가지를 함께 본다. */
+  /** 현재 화면의 "뽑기 결과 지문". 내용(팝업/잔액)과 사건(API/DOM 변형)을 함께 담는다. */
   function drawSignature() {
     const popup = document.querySelector(SEL.rewardPopup);
 
     return {
+      at: Date.now(),
       node: popup || null,
+      hasPopup: Boolean(popup),
       text: popup ? (popup.innerText || '').trim() : '',
       flake: getFlakeCount(),
+      mutations: PROBE.popupMutations,
+      appears: PROBE.popupAppears,
     };
   }
 
   /**
+   * 첫 성공 회차에서 뽑기 API 주소를 학습한다.
+   *
+   * 엔드포인트 이름을 미리 추측하지 않는다 — 클릭 직후 처음 나간 비-GET 요청이
+   * 곧 뽑기 요청이다. 한 번 학습해두면 이후 회차는 이 신호가 가장 정확하다.
+   * (보상 문구가 같아도, 잔액 표시가 늦게 갱신돼도 흔들리지 않는다)
+   */
+  function learnDrawApi(since) {
+    if (PROBE.drawApiHint) return;
+
+    const [first] = apiEventsAfter(since);
+    if (!first) return;
+
+    const path = first.url.replace(/^https?:\/\/[^/]+/, '');
+    if (!path || path.length < 4) return;
+
+    PROBE.drawApiHint = path;
+    console.log('[stove] 뽑기 API 학습:', path);
+  }
+
+  /**
    * 클릭 이후 실제로 1회가 소모되었는지 확인한다.
-   * - 보상 팝업 노드가 교체되었거나 문구가 바뀌었다 → 성공
-   * - 플레이크 잔액이 변했다 → 성공
-   * 둘 중 하나도 없으면 "클릭은 됐지만 뽑히지 않은" 상태로 본다.
+   *
+   * 신호는 강한 순서대로 본다.
+   *   api        학습된 뽑기 요청이 실제로 나갔다        ← 가장 확실
+   *   popup-new  팝업이 없다가 새로 떴다
+   *   popup-text 팝업 문구가 바뀌었다
+   *   popup-node 팝업 노드 자체가 교체됐다
+   *   flake      잔액이 변했다
+   *   popup-dom  팝업 내부가 다시 그려졌다 (문구가 같아도 잡히는 마지막 그물)
    */
   async function waitForDrawResult(before, timeout = CFG.DRAW_RESULT_TIMEOUT) {
     const end = Date.now() + timeout;
 
     while (Date.now() < end) {
       const now = drawSignature();
+      const elapsed = now.at - before.at;
 
-      const popupChanged =
-        Boolean(now.node) &&
-        Boolean(now.text) &&
-        (now.node !== before.node || now.text !== before.text);
+      const apiFired =
+        Boolean(PROBE.drawApiHint) &&
+        apiEventsAfter(before.at, PROBE.drawApiHint).length > 0;
+
+      const popupAppeared = now.hasPopup && now.appears > before.appears;
+      const popupTextChanged = now.hasPopup && Boolean(now.text) && now.text !== before.text;
+      const popupNodeChanged = now.hasPopup && Boolean(before.node) && now.node !== before.node;
 
       const flakeChanged =
         now.flake !== null && before.flake !== null && now.flake !== before.flake;
 
-      if (popupChanged || flakeChanged) {
-        return { ok: true, via: popupChanged ? 'popup' : 'flake', ...now };
+      // 클릭 직후의 잔여 애니메이션을 결과로 오인하지 않도록 하한선을 둔다.
+      const popupMutated =
+        now.hasPopup &&
+        now.mutations > before.mutations &&
+        elapsed >= CFG.DRAW_MIN_MUTATION_MS;
+
+      const via =
+        (apiFired && 'api') ||
+        (popupAppeared && 'popup-new') ||
+        (popupTextChanged && 'popup-text') ||
+        (popupNodeChanged && 'popup-node') ||
+        (flakeChanged && 'flake') ||
+        (popupMutated && 'popup-dom') ||
+        '';
+
+      if (via) {
+        if (via !== 'api') learnDrawApi(before.at);
+        return { ok: true, via, ...now };
       }
 
       beat();
@@ -1576,13 +1841,17 @@
   }
 
   /**
-   * 다음 회차의 판정 기준선을 만든다 — 이전 회차 보상 팝업을 치워 '팝업 없음' 상태로.
+   * 보상 팝업을 치운다.
    *
-   * 이게 없으면 판정이 '팝업 내용이 바뀌었는가'에 의존하게 되는데,
-   * 같은 보상이 연속으로 나오면 노드도 텍스트도 그대로라 바뀐 게 없다.
-   * 그러면 멀쩡히 뽑힌 회차를 실패로 오판한다. (0.5.0 뽑기 중간 멈춤의 원인)
+   * 주의 — 회차마다 습관적으로 부르면 안 된다.
+   * '{금액} 뽑기 한번 더!' 버튼이 바로 이 팝업 안에 있어서, 닫는 순간 다음 회차의
+   * 진입점이 사라진다. 0.6.0 은 판정 기준선을 만들려고 매 회차 이걸 불렀고,
+   * 그래서 30회를 채우지 못하고 "뽑기 버튼을 찾지 못했습니다" 로 끊겼다.
    *
-   * 단, 소진 팝업은 여기서 닫으면 안 된다. 닫아버리면 소진을 감지할 근거가 사라진다.
+   * 지금은 뽑기 버튼을 정말로 못 찾았을 때의 마지막 수단으로만 쓴다.
+   * (판정 기준선은 PROBE 가 대신 만든다 — waitForDrawResult 참고)
+   *
+   * 소진 팝업은 여기서 닫지 않는다. 닫아버리면 소진을 감지할 근거가 사라진다.
    */
   async function clearDrawResultPopup() {
     for (let i = 0; i < 3; i++) {
@@ -1711,25 +1980,35 @@
     let stopReason = '';
     let gained = 0;
     let unverified = 0;
+    let unverifiedStreak = 0;
 
     for (let drawNo = 1; drawNo <= CFG.DRAW_COUNT; drawNo++) {
-      // 이전 회차 팝업을 치워 '팝업 없음' 기준선을 만든다.
-      // 판정이 '부재 → 등장' 이라는 내용 무관 신호가 되어야
-      // 같은 보상이 연속으로 나와도 오판하지 않는다.
-      await clearDrawResultPopup();
-
       if (isDailyDrawExhausted()) {
         exhausted = true;
         break;
       }
 
-      // 팝업을 닫으면 '한번 더' 대신 처음 뽑기 버튼으로 돌아가는 화면도 있어
-      // 두 버튼을 항상 함께 본다.
-      const button = await waitFor(
+      // 팝업을 닫지 않는다. '한번 더' 버튼이 그 안에 있기 때문이다.
+      // 팝업이 없는 화면(첫 회차, 또는 사이트가 스스로 닫은 경우)에서는
+      // 처음 뽑기 버튼으로 돌아가므로 두 버튼을 항상 함께 본다.
+      let button = await waitFor(
         () => findRepeatDrawButton(cost) || findInitialDrawButton(cost),
-        drawNo === 1 ? 12000 : 10000,
+        drawNo === 1 ? 12000 : 9000,
         200
       );
+
+      // 정말로 못 찾은 경우에만, 마지막 수단으로 팝업을 치우고 다시 본다.
+      if (!button && !isDailyDrawExhausted()) {
+        logStatus(`🔎 ${drawNo}회차 뽑기 버튼이 가려진 듯해 팝업을 치우고 다시 찾습니다.`);
+
+        if (await clearDrawResultPopup()) {
+          button = await waitFor(
+            () => findRepeatDrawButton(cost) || findInitialDrawButton(cost),
+            6000,
+            200
+          );
+        }
+      }
 
       if (isDailyDrawExhausted()) {
         exhausted = true;
@@ -1775,18 +2054,26 @@
         }
 
         unverified++;
+        unverifiedStreak++;
+
         dumpDrawFailure(drawNo, before, cost);
 
-        if (unverified > CFG.DRAW_UNVERIFIED_LIMIT) {
-          stopReason = `${drawNo}회차까지 결과 확인 실패가 ${unverified}회 누적되어 중단합니다.`;
+        // 누적이 아니라 연속으로 센다.
+        // 30회 중 드문드문 놓치는 건 판정 타이밍 문제일 뿐 뽑기는 정상으로 돌아간다.
+        if (unverifiedStreak >= CFG.DRAW_UNVERIFIED_LIMIT) {
+          stopReason =
+            `${drawNo}회차까지 결과 확인 실패가 연속 ${unverifiedStreak}회라 중단합니다. ` +
+            `(누적 ${unverified}회)`;
           break;
         }
 
         // 클릭을 1회만 했으므로 중복 소모는 없다. 여기서 멈출 이유가 없다.
         logStatus(
           `⚠️ ${drawNo}회차 결과를 확인하지 못했지만 클릭은 1회뿐이라 계속 진행합니다. ` +
-            `(누적 ${unverified}/${CFG.DRAW_UNVERIFIED_LIMIT})`
+            `(연속 ${unverifiedStreak}/${CFG.DRAW_UNVERIFIED_LIMIT})`
         );
+      } else {
+        unverifiedStreak = 0;
       }
 
       completed = drawNo;
@@ -2288,18 +2575,81 @@
     return false;
   }
 
-  function pendingPopularPosts() {
+  /**
+   * 게시글 하나에 해당하는 카드 요소.
+   *
+   * 앵커에서 위로 올라가되, 다른 글의 앵커까지 품기 시작하면 카드 경계를 넘은 것이므로
+   * 즉시 포기한다. 이 선을 안 그으면 섹션 전체를 카드로 잡아 다른 글의 '받기 완료' 를
+   * 자기 상태로 착각한다.
+   */
+  function popularCardOf(anchor, section) {
+    let node = anchor.parentElement;
+
+    for (let i = 0; i < 8 && node && node !== section; i++) {
+      if (node.querySelectorAll(SEL.popularAnchor).length > 1) return null;
+      if (node.querySelector('button')) return node;
+
+      node = node.parentElement;
+    }
+
+    return null;
+  }
+
+  /** 지금 누를 수 있는 인기 게시글 수령 버튼 하나 */
+  function popularClaimableButton(root) {
+    return (
+      [...root.querySelectorAll('button')].find(button => {
+        if (button.disabled || !isVisible(button)) return false;
+
+        const text = squash(button.innerText);
+
+        if (!text || /완료$/.test(text)) return false;
+
+        return text === '받기' || /플레이크받기$/.test(text);
+      }) || null
+    );
+  }
+
+  /**
+   * 인기 게시글 카드 전수.
+   * 링크 · 카드 · 수령 가능 여부 · 완료 여부를 한 번에 읽어 한 곳에서 판단한다.
+   */
+  function popularCards() {
     const section = popularSection();
     if (!section) return [];
 
-    const unique = new Map();
+    const seen = new Set();
+    const cards = [];
 
     for (const anchor of section.querySelectorAll(SEL.popularAnchor)) {
-      if (!anchor.href || unique.has(anchor.href) || isPopularComplete(anchor, section)) continue;
-      unique.set(anchor.href, anchor);
+      const href = anchor.href;
+
+      if (!href || seen.has(href)) continue;
+      seen.add(href);
+
+      const card = popularCardOf(anchor, section);
+
+      // 카드를 특정할 수 있으면 그 안의 버튼이 가장 정확한 근거다.
+      // 못 하면 예전 휴리스틱(주변 텍스트)으로 물러선다.
+      const complete = card
+        ? [...card.querySelectorAll('button')].some(button =>
+            /완료$/.test(squash(button.innerText))
+          )
+        : isPopularComplete(anchor, section);
+
+      cards.push({
+        href,
+        card,
+        complete,
+        claimable: Boolean(card && popularClaimableButton(card)),
+      });
     }
 
-    return [...unique.values()].slice(0, 3);
+    return cards;
+  }
+
+  function pendingPopularPosts() {
+    return popularCards().filter(card => !card.complete);
   }
 
   async function collectPopular() {
@@ -2308,113 +2658,148 @@
     // 버튼 목록을 한 번에 캡처해두면 안 된다.
     // 한 개를 누르는 순간 Vue 가 리스트를 다시 그려 나머지는 detached 노드가 되고,
     // 그 노드에 대한 click() 은 조용히 무시된다. 매번 새로 찾는다.
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 12; i++) {
       const section = popularSection();
 
       if (!section) break;
 
-      const button = [...section.querySelectorAll('button')].find(btn => {
-        if (btn.disabled || !isVisible(btn)) return false;
-
-        const text = squash(btn.innerText);
-
-        if (/완료$/.test(text)) return false;
-
-        return text === '받기' || /플레이크받기$/.test(text);
-      });
+      const button = popularClaimableButton(section);
 
       if (!button) {
         if (i === 0) dumpSectionButtons('popular', '인기 게시글(수령 버튼 없음)', section);
         break;
       }
 
+      const beforeFlake = getFlakeCount();
+
       await clickWithScroll(button);
       count++;
-
-      logStatus(`🎁 인기 게시글 보상 수령 (${count})`);
 
       // 보상 팝업이 남아 있으면 다음 '받기' 버튼 클릭이 오버레이에 막힌다.
       // 0.5.0 에서 첫 한 개만 받히고 나머지가 누락되던 원인.
       await delay(1500);
       await closeVisiblePopup();
-      await delay(400);
+      await delay(500);
+
+      const afterFlake = getFlakeCount();
+
+      const gained =
+        beforeFlake != null && afterFlake != null && afterFlake > beforeFlake
+          ? afterFlake - beforeFlake
+          : null;
+
+      logStatus(
+        `🎁 인기 게시글 보상 수령 (${count})` + (gained ? ` +${gained.toLocaleString()}` : '')
+      );
     }
 
     return count;
   }
 
-  /** 섹션에 걸린 인기 게시글 전체 개수 (분모 표시용) */
-  function popularTotal() {
-    const section = popularSection();
-    if (!section) return 0;
-
-    return new Set(
-      [...section.querySelectorAll(SEL.popularAnchor)].map(a => a.href).filter(Boolean)
-    ).size;
-  }
-
+  /**
+   * 인기 게시글 미션 전체.
+   *
+   *   1. 아직 완료되지 않은 글을 새 탭으로 방문한다.
+   *      그 탭에서는 방문 도우미가 스크롤하며 체류한 뒤 스스로 닫는다.
+   *      (백그라운드 탭을 4초 열어두기만 해서는 '읽음' 이 인정되지 않는 경우가 있다)
+   *   2. 수령한다. 방문이 서버에 반영되기까지 몇 초 걸리므로 라운드로 재확인한다.
+   *   3. 그래도 남으면 그 글만 다시, 더 길게 방문한다.
+   */
   async function runPopular() {
-    const posts = pendingPopularPosts();
-    const total = popularTotal();
+    const section = popularSection();
 
-    if (!posts.length) {
-      // 섹션은 있는데 남은 글이 없다 = 이미 전부 처리된 상태
-      const already = total > 0;
+    if (!section) {
+      patchProgress({ popularTotal: 0, popularVisited: 0, popularState: 'none' });
+      logStatus('⏭️ 인기 게시글 미션: 섹션을 찾지 못했습니다.');
 
-      patchProgress({
-        popularTotal: total,
-        popularVisited: already ? total : 0,
-        popularState: already ? 'already' : 'none',
-      });
-
-      logStatus(
-        already
-          ? `☑️ 인기 게시글 미션: ${total}개는 방문 처리된 상태입니다. 수령만 확인합니다.`
-          : '⏭️ 인기 게시글 미션: 대상 게시글을 찾지 못했습니다.'
+      dumpSectionButtons(
+        'popular',
+        '인기 게시글(섹션 미검출)',
+        findLeafByText('인기 게시글 보고 플레이크 받기!')?.parentElement || null
       );
 
-      if (!already) dumpSectionButtons('popular', '인기 게시글(대상 없음)', popularSection());
+      return 0;
+    }
 
-      // 방문은 끝났는데 수령만 안 된 상태가 있다. 여기서 return 0 으로 빠지면
-      // 그 보상은 영영 못 받는다. 수령은 항상 한 번 시도한다.
+    const cards = popularCards();
+    const total = cards.length;
+
+    patchProgress({ popularTotal: total, popularState: 'running' });
+
+    if (!total) {
+      patchProgress({ popularState: 'none' });
+      logStatus('⏭️ 인기 게시글 미션: 대상 게시글을 찾지 못했습니다.');
+
+      dumpSectionButtons('popular', '인기 게시글(대상 없음)', section);
+
+      // 링크를 못 읽어도 수령 버튼은 열려 있을 수 있다. 수령은 항상 한 번 시도한다.
       return collectPopular();
     }
 
-    logStatus(`📰 인기 게시글 ${posts.length}/3개 자동 방문`);
+    // --- 1) 방문 ---
+    // 이미 수령 가능한 글은 방문할 이유가 없다.
+    const toVisit = cards.filter(card => !card.complete && !card.claimable).map(card => card.href);
 
-    const hrefs = posts.map(post => post.href);
+    if (toVisit.length) {
+      logStatus(`📰 인기 게시글 ${toVisit.length}/${total}개 방문을 시작합니다.`);
 
-    for (let i = 0; i < hrefs.length; i++) {
-      let opened = null;
-
-      try {
-        opened = GM_openInTab(hrefs[i], { active: false, insert: true, setParent: true });
-      } catch (error) {
-        logStatus(`⚠️ 새 탭 열기 실패: ${error?.message || error}`);
-        continue;
-      }
-
-      logStatus(`🔗 ${i + 1}/${hrefs.length} 방문 중`);
-
-      await delay(CFG.VISIT_WAIT);
-
-      try {
-        opened?.close();
-      } catch (_) {
-        /* 이미 닫힌 경우 무시 */
-      }
-
-      await delay(400);
+      await visitPopularPosts(toVisit, CFG.POPULAR_VISIT_WAIT);
+      await refreshMissionList();
+    } else {
+      logStatus(`☑️ 인기 게시글: 방문이 필요한 글이 없습니다. 수령만 진행합니다.`);
     }
 
+    // --- 2) 수령 (+ 3) 미완료 글 재방문) ---
+    let claimed = 0;
+
+    for (let round = 1; round <= CFG.POPULAR_CLAIM_ROUNDS; round++) {
+      claimed += await collectPopular();
+
+      const left = pendingPopularPosts();
+
+      if (!left.length) break;
+
+      const lastRound = round === CFG.POPULAR_CLAIM_ROUNDS;
+
+      if (lastRound) {
+        logStatus(`⚠️ 인기 게시글 ${left.length}개는 끝내 수령하지 못했습니다.`);
+        dumpSectionButtons('popular', '인기 게시글(수령 실패)', popularSection());
+        break;
+      }
+
+      // 마지막 라운드 직전, 체류가 짧아 인정되지 않은 글을 더 길게 다시 방문한다.
+      if (CFG.POPULAR_REVISIT && round === CFG.POPULAR_CLAIM_ROUNDS - 1) {
+        logStatus(`🔁 인기 게시글 ${left.length}개가 아직 수령 대기 — 더 길게 재방문합니다.`);
+        await visitPopularPosts(left.map(card => card.href), CFG.POPULAR_VISIT_WAIT + 4000);
+      } else {
+        logStatus(
+          `⏳ 인기 게시글 수령 반영 대기 ${round}/${CFG.POPULAR_CLAIM_ROUNDS} (남은 ${left.length}개)`
+        );
+
+        await delay(CFG.POPULAR_CLAIM_DELAY);
+      }
+
+      await refreshMissionList();
+    }
+
+    const finalCards = popularCards();
+    const finalTotal = finalCards.length || total;
+    const done = finalCards.filter(card => card.complete).length;
+
     patchProgress({
-      popularVisited: hrefs.length,
-      popularTotal: total || hrefs.length,
-      popularState: 'done',
+      popularTotal: finalTotal,
+      popularVisited: done,
+      popularClaimed: claimed,
+      popularState: done >= finalTotal ? 'done' : claimed ? 'partial' : 'pending',
     });
 
-    await refreshMissionList();
-    return collectPopular();
+    logStatus(
+      claimed
+        ? `✅ 인기 게시글 보상 ${claimed}개 수령 (완료 ${done}/${finalTotal})`
+        : `⏭️ 인기 게시글: 이번 실행에서 새로 수령한 보상은 없습니다. (완료 ${done}/${finalTotal})`
+    );
+
+    return claimed;
   }
 
   // =========================================================================
@@ -2587,60 +2972,146 @@
   }
 
   /**
-   * 방문 미션 버튼은 사이트가 window.open 으로 새 탭을 연다.
-   * 그 핸들은 사이트 쪽에만 있어서 스크립트가 닫을 수 없고, 탭이 그대로 쌓인다.
+   * 방문 미션이 여는 새 탭을 우리가 쥐기 위한 장치.
    *
-   * 클릭하는 순간에만 window.open 을 감싸서, 우리가 GM_openInTab 으로 대신 열고
-   * 그 핸들을 쥔다. 체류 시간이 지나면 우리가 연 탭만 정확히 닫는다.
+   * 0.6.0 은 샌드박스의 window.open 만 감쌌다. 하지만 Tampermonkey 는 스크립트를
+   * 격리된 샌드박스에서 돌리고, 사이트 코드는 페이지 컨텍스트에서 실행된다.
+   * 즉 사이트가 부르는 window.open 은 우리가 바꾼 그 함수가 아니다.
+   * → 후킹이 한 번도 걸리지 않아 opened 가 늘 비어 있었고, 탭 3개가 그대로 남았다.
+   *
+   * 그래서 세 겹으로 잡는다.
+   *   1) unsafeWindow.open (= 페이지 컨텍스트의 진짜 open) 을 감싼다.
+   *   2) <a target="_blank"> 클릭을 캡처 단계에서 가로챈다. (window.open 을 안 쓰는 경우)
+   *   3) 그래도 새면, 열린 탭 쪽의 방문 도우미가 스스로 닫는다. (runHelperPage)
    */
-  async function clickVisitMissionAndClose(button, waitMs = CFG.VISIT_WAIT) {
-    const opened = [];
-    const nativeOpen = window.open;
+  function captureNewTabs() {
+    const handles = [];
+    const restores = [];
 
-    window.open = function (url, name, features) {
-      const href = String(url || '');
+    const openViaGM = href => {
+      try {
+        const handle = GM_openInTab(String(href), {
+          active: false,
+          insert: true,
+          setParent: true,
+        });
 
-      if (href) {
-        try {
-          const handle = GM_openInTab(href, { active: false, insert: true, setParent: true });
-
-          if (handle) {
-            opened.push(handle);
-
-            // 사이트 코드가 반환값을 만지는 경우가 있어 최소한의 형태는 돌려준다.
-            return { closed: false, close() {}, focus() {} };
-          }
-        } catch (_) {
-          /* GM_openInTab 실패 시 아래 원래 동작으로 */
+        if (handle) {
+          handles.push(handle);
+          return true;
         }
+      } catch (error) {
+        console.warn('[stove] GM_openInTab 실패', error);
       }
 
-      const native = nativeOpen.call(window, url, name, features);
-
-      if (native) opened.push(native);
-
-      return native;
+      return false;
     };
+
+    // 사이트 코드가 반환값을 만지는 경우가 있어 최소한의 형태는 돌려준다.
+    const stub = {
+      closed: false,
+      close() {},
+      focus() {},
+      blur() {},
+      postMessage() {},
+    };
+
+    const scopes = new Set([window]);
+
+    if (typeof unsafeWindow !== 'undefined' && unsafeWindow) scopes.add(unsafeWindow);
+
+    for (const scope of scopes) {
+      let native = null;
+
+      try {
+        native = scope.open;
+      } catch (_) {
+        continue;
+      }
+
+      if (typeof native !== 'function') continue;
+
+      try {
+        scope.open = function (url, name, features) {
+          const href = String(url || '');
+
+          if (href && !href.startsWith('javascript:') && openViaGM(href)) return stub;
+
+          const opened = native.call(scope, url, name, features);
+
+          if (opened) handles.push(opened);
+
+          return opened;
+        };
+
+        restores.push(() => {
+          try {
+            scope.open = native;
+          } catch (_) {
+            /* 무시 */
+          }
+        });
+      } catch (_) {
+        /* 이 스코프는 못 감쌌다 — 나머지로 계속 */
+      }
+    }
+
+    // 기본 동작(새 탭)만 막고 전파는 그대로 둔다.
+    // 사이트의 미션 처리 핸들러는 그대로 실행되어야 방문이 인정된다.
+    const onAnchorClick = event => {
+      const anchor = event.target?.closest?.('a[href]');
+
+      if (!anchor || anchor.target !== '_blank') return;
+
+      const href = anchor.href;
+
+      if (!href || href.startsWith('javascript:')) return;
+      if (openViaGM(href)) event.preventDefault();
+    };
+
+    document.addEventListener('click', onAnchorClick, true);
+    restores.push(() => document.removeEventListener('click', onAnchorClick, true));
+
+    return {
+      handles,
+
+      stop() {
+        for (const restore of restores) restore();
+      },
+
+      closeAll() {
+        let closed = 0;
+
+        for (const handle of handles) {
+          try {
+            handle?.close?.();
+            closed++;
+          } catch (_) {
+            /* 이미 닫힌 경우 무시 */
+          }
+        }
+
+        return closed;
+      },
+    };
+  }
+
+  async function clickVisitMissionAndClose(button, waitMs = CFG.VISIT_WAIT) {
+    const capture = captureNewTabs();
+
+    // 후킹이 뚫려 사이트가 직접 탭을 열어도 그 탭이 스스로 닫도록 도우미 창을 열어둔다.
+    openVisitWindow('visit', [], waitMs + CFG.VISIT_TAB_GRACE_MS);
 
     try {
       button.click();
       await delay(waitMs);
     } finally {
-      window.open = nativeOpen;
+      capture.stop();
     }
 
-    let closed = 0;
+    const closed = capture.closeAll();
 
-    for (const handle of opened) {
-      try {
-        handle?.close?.();
-        closed++;
-      } catch (_) {
-        /* 이미 닫힌 경우 무시 */
-      }
-    }
-
-    return { opened: opened.length, closed };
+    return { opened: capture.handles.length, closed };
   }
 
   async function runRewardMissions() {
@@ -2679,7 +3150,7 @@
           `🔗 방문 미션: ${title}` +
             (tabs.opened
               ? ` (새 탭 ${tabs.closed}/${tabs.opened}개 자동 닫음)`
-              : ' (새 탭 핸들을 잡지 못해 닫지 못했습니다)')
+              : ' (새 탭을 가로채지 못했습니다 — 열린 탭이 스스로 닫습니다)')
         );
       } else if (state === 'claimable' || state === 'already') {
         visitCount++;
@@ -2994,6 +3465,8 @@
 
     const message = String(error?.message || error);
 
+    closeVisitWindow();
+
     setMain({ active: false, phase: 'error', error: message });
     logStatus(`❌ ${message}`);
 
@@ -3005,6 +3478,9 @@
 
   function stopAutomation(reason) {
     running = false;
+
+    // 방문 도우미 지시를 남겨두면, 중지 후 사용자가 여는 탭까지 스스로 닫을 수 있다.
+    closeVisitWindow();
 
     setMain({ active: false, phase: 'idle', error: '', stoppedAt: Date.now() });
     logStatus(`🛑 ${reason}`);
@@ -3022,6 +3498,159 @@
     dailyshop: 'event.onstove.com',
     lounge: 'lounge.onstove.com',
   };
+
+  /** 자동화가 직접 조작하는 페이지들. 이 밖의 매치는 전부 "방문 도우미" 용이다. */
+  const AUTOMATION_HOSTS = [HOST.reward, HOST.dailyshop, HOST.lounge];
+
+  // ===========================================================================
+  // 14-1. 방문 도우미 (새 탭에서 체류하고 스스로 닫는 모드)
+  // ===========================================================================
+
+  /**
+   * 방문 미션과 인기 게시글은 새 탭을 연다. 문제는 두 가지였다.
+   *
+   *   1) 사이트가 연 탭은 우리 쪽에 핸들이 없어 닫지 못하고 그대로 쌓인다.
+   *   2) 백그라운드 탭을 잠깐 열어두기만 해서는 '읽음' 이 인정되지 않을 수 있다.
+   *
+   * 그래서 열리는 탭 쪽에도 스크립트를 매치시켜, 그 탭이 스스로 스크롤하며 체류한 뒤
+   * 스스로 닫게 한다. 지시는 GM storage 로 넘긴다 (탭 사이 공유가 되는 유일한 통로).
+   *
+   * 사용자가 직접 연 탭까지 닫아버리면 안 되므로 두 가지를 함께 요구한다.
+   *   - 지시가 아직 유효 시간 안일 것
+   *   - 자동화 페이지에서 파생된 탭일 것 (opener 가 있거나 referrer 가 자동화 도메인)
+   */
+  function getVisitTask() {
+    const value = GM_getValue(KEY.VISIT, null);
+
+    return value && typeof value === 'object' ? value : null;
+  }
+
+  function openVisitWindow(kind, urls, ms) {
+    GM_setValue(KEY.VISIT, {
+      kind,
+      urls: (urls || []).map(url => String(url || '').split('#')[0]),
+      until: Date.now() + ms,
+      at: Date.now(),
+    });
+  }
+
+  function closeVisitWindow() {
+    GM_deleteValue(KEY.VISIT);
+  }
+
+  function isHelperPage() {
+    return !AUTOMATION_HOSTS.includes(location.hostname);
+  }
+
+  function activeVisitTask() {
+    const task = getVisitTask();
+
+    if (!task || Date.now() > (task.until || 0)) return null;
+
+    const fromAutomation =
+      Boolean(window.opener) ||
+      new RegExp(AUTOMATION_HOSTS.join('|').replace(/\./g, '\\.')).test(document.referrer || '');
+
+    if (!fromAutomation) return null;
+
+    // 인기 게시글은 대상 주소가 정해져 있다. 목록에 없는 탭은 건드리지 않는다.
+    if (task.kind === 'popular' && task.urls?.length) {
+      const here = location.href.split('#')[0];
+
+      const matched = task.urls.some(
+        url => url && (here.startsWith(url) || url.startsWith(here))
+      );
+
+      if (!matched) return null;
+    }
+
+    return task;
+  }
+
+  /** 사람이 읽는 것처럼 천천히 훑어 내린다. */
+  async function humanDwell(ms) {
+    const step = Math.max(400, Math.round(ms / 8));
+    const end = Date.now() + ms;
+
+    while (Date.now() < end) {
+      try {
+        window.scrollBy({ top: Math.round(window.innerHeight * 0.6), behavior: 'smooth' });
+      } catch (_) {
+        window.scrollBy(0, 400);
+      }
+
+      await delay(step);
+    }
+  }
+
+  function closeSelfTab() {
+    try {
+      window.close();
+    } catch (_) {
+      /* 무시 */
+    }
+
+    // @grant window.close 가 없거나 브라우저가 막는 경우를 위한 마지막 시도
+    setTimeout(() => {
+      try {
+        window.top.close();
+      } catch (_) {
+        /* 무시 */
+      }
+    }, 500);
+  }
+
+  async function runHelperPage() {
+    const task = activeVisitTask();
+
+    // 자동화가 연 탭이 아니다 — 사용자의 탭이므로 아무것도 하지 않는다.
+    if (!task) return;
+
+    console.log('[stove] 방문 도우미: 체류 후 이 탭을 닫습니다.', location.href);
+
+    await humanDwell(task.kind === 'popular' ? CFG.POPULAR_VISIT_WAIT : CFG.VISIT_WAIT);
+
+    closeSelfTab();
+  }
+
+  /** 인기 게시글을 하나씩 새 탭으로 열어 체류시키고 닫는다. */
+  async function visitPopularPosts(hrefs, waitMs) {
+    if (!hrefs.length) return 0;
+
+    // 도우미 유효 창은 전체 방문에 걸친다 (탭이 늦게 뜨는 경우까지 감안).
+    openVisitWindow('popular', hrefs, hrefs.length * (waitMs + 3000) + CFG.VISIT_TAB_GRACE_MS);
+
+    let visited = 0;
+
+    for (let i = 0; i < hrefs.length; i++) {
+      let handle = null;
+
+      try {
+        handle = GM_openInTab(hrefs[i], { active: false, insert: true, setParent: true });
+      } catch (error) {
+        logStatus(`⚠️ 인기 게시글 새 탭 열기 실패: ${error?.message || error}`);
+        continue;
+      }
+
+      logStatus(`🔗 인기 게시글 ${i + 1}/${hrefs.length} 방문 중 (${Math.round(waitMs / 1000)}초 체류)`);
+
+      await delay(waitMs);
+
+      // 도우미가 이미 닫았을 수도 있다. 그래도 한 번 더 확실히 닫는다.
+      try {
+        handle?.close?.();
+      } catch (_) {
+        /* 이미 닫힌 경우 무시 */
+      }
+
+      visited++;
+      await delay(700);
+    }
+
+    closeVisitWindow();
+
+    return visited;
+  }
 
   /**
    * phase 별 담당 페이지와 실행 함수.
@@ -3269,6 +3898,16 @@
 
   async function main() {
     try {
+      // 방문 미션·인기 게시글이 연 탭. 상태 패널도, 워치독도 띄우지 않는다.
+      // 지시가 없으면(사용자가 직접 연 탭이면) 조용히 아무것도 하지 않는다.
+      if (isHelperPage()) {
+        await runHelperPage();
+        return;
+      }
+
+      installNetworkProbe();
+      installPopupProbe();
+
       createStatusPanel();
       createDrawPanel();
       cleanupOldRetries();
@@ -3312,11 +3951,31 @@
   diagHost.__stoveDiag = window.__stoveDiag = {
     popular: () => dumpSectionButtons('popular', '인기 게시글(수동 조회)', popularSection()),
     survey: () => dumpSectionButtons('survey', '설문(수동 조회)', surveySection()),
-    state: () => ({ version: VERSION, url: location.href, main: getMain(), retries: getRetries() }),
+    cards: () => popularCards().map(({ href, complete, claimable }) => ({ href, complete, claimable })),
+    probe: () => ({
+      drawApiHint: PROBE.drawApiHint,
+      popupAppears: PROBE.popupAppears,
+      popupMutations: PROBE.popupMutations,
+      recentApi: PROBE.apiEvents.slice(-10),
+    }),
+    state: () => ({
+      version: VERSION,
+      url: location.href,
+      main: getMain(),
+      retries: getRetries(),
+      visitTask: getVisitTask(),
+    }),
     raw: () => DIAG,
     dump() {
       return JSON.stringify(
-        { state: this.state(), popular: this.popular(), survey: this.survey(), collected: DIAG },
+        {
+          state: this.state(),
+          probe: this.probe(),
+          popularCards: this.cards(),
+          popular: this.popular(),
+          survey: this.survey(),
+          collected: DIAG,
+        },
         null,
         2
       );
