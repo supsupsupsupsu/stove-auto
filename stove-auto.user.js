@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STOVE 플레이크 전체 자동화 + 상태 패널
 // @namespace    https://github.com/supsupsupsupsu/stove-auto
-// @version      0.5.0
+// @version      0.6.0
 // @description  캡슐 뽑기 → 캡슐 누적 보상 → Daily Shop → 미션 → 인기 게시글 → 라운지 → 보상 수령을 자동 처리합니다. (뽑기 성공 검증 / 단계 워치독 / 자동 복구 포함)
 // @homepageURL  https://github.com/supsupsupsupsu/stove-auto
 // @supportURL   https://github.com/supsupsupsupsu/stove-auto/issues
@@ -15,11 +15,30 @@
 // @grant        GM_deleteValue
 // @grant        GM_openInTab
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @run-at       document-idle
 // ==/UserScript==
 
 /* =============================================================================
  * 변경 이력
+ *
+ * 0.6.0  [수정] Daily Shop 재시도가 페이지를 무한 새로고침시켜 먹통이 되던 문제.
+ *          지난 예약을 armRetryTimer 가 0ms 로 발사 → launchDueRetry 가 같은 주소를
+ *          location.href 에 재대입(=새로고침) → 부팅 → 다시 0ms 예약, 의 고리였다.
+ *          최소 대기(RETRY_MIN_DELAY_MS), 같은 주소면 이동 대신 그 자리 처리,
+ *          findDueRetry 의 inProgress 제외, 재시도 상한/정체 해제로 고리를 끊었다.
+ *        [수정] 뽑기가 중간에 멈추던 문제. 결과 판정이 '팝업 내용 변화'에 의존해
+ *          같은 보상이 연속으로 나오면 성공을 실패로 봤다. 회차마다 팝업을 먼저 닫아
+ *          '부재 → 등장' 이라는 내용 무관 신호로 바꿨다.
+ *          결과 미확인 시 재클릭(중복 소모)을 없애고, 1~2회 실패로는 멈추지 않는다.
+ *        [수정] 인기 게시글 보상이 한 개만 받히던 문제. 버튼 목록을 한 번에 캡처해
+ *          detached 노드를 클릭하고 있었고, 보상 팝업도 안 닫아 다음 클릭이 막혔다.
+ *          방문이 이미 끝난 경우에도 수령은 시도하도록 바꿨다.
+ *        [수정] 설문 보상 누락. 투표 후에도 문구가 '설문 참여하고 N 플레이크 받기' 로
+ *          남는 화면이 있어 일괄 수령(receive 만 선택)에서 빠졌다. 설문 섹션 전용
+ *          수령 경로(claimSurveyReward)를 추가했다.
+ *        [추가] 방문 미션이 여는 새 탭 3개를 체류 후 자동으로 닫는다.
+ *        [추가] 진단 API __stoveDiag / 메뉴 '진단 덤프', '재시도 예약 초기화'.
  *
  * 0.5.0  완료 시 뜨던 요약 토스트 제거 (패널에 같은 내용이 이미 있어 화면만 가림).
  *        '오늘 획득' 표시 추가 — 사이트는 '이번 달 획득'만 제공하므로
@@ -75,12 +94,28 @@
     // 1회 뽑기 결과를 기다리는 최대 시간
     DRAW_RESULT_TIMEOUT: 12000,
 
-    // 결과 확인 실패 시 같은 회차를 다시 시도할 횟수
-    DRAW_RETRY_PER_ROUND: 2,
+    // 위 시간 안에 결과가 안 잡혔을 때 "재클릭 없이" 더 기다리는 유예 시간.
+    // 재클릭은 뽑기 1회를 더 소모시키므로 절대 하지 않는다.
+    DRAW_GRACE_TIMEOUT: 8000,
+
+    // 결과를 끝내 확인하지 못한 회차가 이 횟수를 넘으면 중단한다.
+    // (1~2회는 팝업 렌더 타이밍 문제일 뿐이라 중단할 이유가 없다)
+    DRAW_UNVERIFIED_LIMIT: 3,
 
     // 오늘의 아이템 재시도 간격(4시간) / 당일 최종 시도 시각
     RETRY_INTERVAL_MS: 4 * 60 * 60 * 1000,
     FINAL_RETRY_TIME: '23:50:00',
+
+    // 재시도 예약이 이미 지난 시각이어도 최소 이만큼은 띄우고 실행한다.
+    // 0ms 로 실행하면 같은 주소 재대입 → 새로고침 → 다시 0ms 예약으로
+    // 페이지가 통째로 먹통이 된다. (0.5.0 무한 리로드 버그의 직접 원인)
+    RETRY_MIN_DELAY_MS: 60 * 1000,
+
+    // 하루 재시도 상한 (초과하면 오늘은 포기)
+    RETRY_MAX_COUNT: 6,
+
+    // inProgress 가 이 시간 넘게 유지되면 비정상 종료로 보고 풀어준다.
+    RETRY_STALE_MS: 10 * 60 * 1000,
 
     // 방문 미션 체류 시간
     VISIT_WAIT: 4000,
@@ -196,6 +231,13 @@
   // ===========================================================================
 
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+  /**
+   * 진단 수집기.
+   * 원인을 코드만 보고 확정할 수 없는 구간(뽑기 결과 미확인, 인기글/설문 버튼 문구)의
+   * 원자료를 그대로 담아둔다. 콘솔에서 __stoveDiag.dump() 로 꺼내 공유하면 된다.
+   */
+  const DIAG = { draw: [], popular: [], survey: [] };
 
   const random = (min, max) =>
     Math.floor(Math.random() * (max - min + 1)) + min;
@@ -503,8 +545,24 @@
     let changed = false;
 
     for (const [code, item] of Object.entries(retries)) {
-      if (!item || item.date !== today) {
+      // 날짜가 다르거나, 예약 시각이 깨진(NaN) 항목은 버린다.
+      if (!item || item.date !== today || !Number.isFinite(item.nextAt)) {
         delete retries[code];
+        changed = true;
+        continue;
+      }
+
+      // 재시도 횟수 상한 초과 → 오늘은 종료
+      if ((item.retryCount || 0) > CFG.RETRY_MAX_COUNT) {
+        delete retries[code];
+        changed = true;
+        continue;
+      }
+
+      // 페이지가 중간에 닫혀 inProgress 가 남으면 그 항목은 영영 실행되지 않는다.
+      // 일정 시간이 지나면 풀어준다.
+      if (item.inProgress && Date.now() - (item.startedAt || 0) > CFG.RETRY_STALE_MS) {
+        item.inProgress = false;
         changed = true;
       }
     }
@@ -546,6 +604,7 @@
       nextAt,
       retryCount: (prev.retryCount || 0) + 1,
       inProgress: false,
+      startedAt: 0,
       returnUrl: prev.returnUrl || '',
     };
 
@@ -568,9 +627,11 @@
     const retries = cleanupOldRetries();
     const now = Date.now();
 
+    // inProgress 인 항목을 다시 '실행 대상'으로 잡으면 진행 중인 재시도를
+    // 처음부터 다시 밟게 되어 루프가 된다. 반드시 제외한다.
     return (
       Object.entries(retries)
-        .filter(([, item]) => item?.pending && item.nextAt <= now)
+        .filter(([, item]) => item?.pending && !item.inProgress && item.nextAt <= now)
         .sort((a, b) => a[1].nextAt - b[1].nextAt)[0] || null
     );
   }
@@ -581,12 +642,15 @@
     if (getMain().active) return;
 
     const pending = Object.entries(getRetries())
-      .filter(([, item]) => item?.pending && item.date === kstDateKey())
+      .filter(([, item]) => item?.pending && !item.inProgress && item.date === kstDateKey())
       .sort((a, b) => a[1].nextAt - b[1].nextAt)[0];
 
     if (!pending) return;
 
-    const wait = Math.max(0, pending[1].nextAt - Date.now());
+    // 지난 시각이라고 0ms 로 잡으면 안 된다.
+    // launchDueRetry → 같은 주소 재대입 → 새로고침 → main → armRetryTimer(0ms)
+    // 로 이어지는 무한 리로드가 되어 페이지 자체가 먹통이 된다.
+    const wait = Math.max(CFG.RETRY_MIN_DELAY_MS, pending[1].nextAt - Date.now());
 
     clearTimeout(window.__stoveRetryTimer);
     window.__stoveRetryTimer = setTimeout(launchDueRetry, Math.min(wait, 2147483000));
@@ -597,29 +661,48 @@
 
     const due = findDueRetry();
 
-    if (!due) {
-      armRetryTimer();
-      return;
-    }
+    // 여기서 armRetryTimer() 를 다시 부르면 두 함수가 서로를 호출하는 고리가 된다.
+    // 예약은 bootIdlePage / runDailyRetry 종료 지점에서만 다시 건다.
+    if (!due) return;
 
-    const [code] = due;
-    const shop = DAILY_SHOPS.find(item => item.code === code);
+    const [code, item] = due;
+    const shop = DAILY_SHOPS.find(entry => entry.code === code);
 
     if (!shop) {
       clearDailyRetry(code);
       return;
     }
 
+    if ((item.retryCount || 0) > CFG.RETRY_MAX_COUNT) {
+      logStatus(`⏭️ ${shop.label}: 재시도 ${CFG.RETRY_MAX_COUNT}회를 넘겨 오늘은 종료합니다.`);
+      clearDailyRetry(code);
+      return;
+    }
+
+    const target = shopUrl(shop);
+    const alreadyThere = currentDailyShop()?.code === code;
+
     const retries = getRetries();
 
     retries[code] = {
       ...retries[code],
       inProgress: true,
-      returnUrl: location.href,
+      startedAt: Date.now(),
+      // 이미 대상 페이지에 있으면 '돌아갈 곳'이 자기 자신이 되어 버린다.
+      // 그 값을 저장하면 재시도가 끝난 뒤 같은 페이지로 다시 튕겨 루프가 된다.
+      returnUrl: alreadyThere ? retries[code]?.returnUrl || '' : location.href,
     };
 
     setRetries(retries);
-    location.href = shopUrl(shop);
+
+    if (alreadyThere) {
+      // 같은 주소를 location.href 에 다시 넣으면 새로고침이 된다.
+      // 이동하지 말고 이 자리에서 바로 처리한다.
+      void runDailyRetry(shop);
+      return;
+    }
+
+    location.href = target;
   }
 
   // ===========================================================================
@@ -1492,6 +1575,56 @@
     return closeVisiblePopup();
   }
 
+  /**
+   * 다음 회차의 판정 기준선을 만든다 — 이전 회차 보상 팝업을 치워 '팝업 없음' 상태로.
+   *
+   * 이게 없으면 판정이 '팝업 내용이 바뀌었는가'에 의존하게 되는데,
+   * 같은 보상이 연속으로 나오면 노드도 텍스트도 그대로라 바뀐 게 없다.
+   * 그러면 멀쩡히 뽑힌 회차를 실패로 오판한다. (0.5.0 뽑기 중간 멈춤의 원인)
+   *
+   * 단, 소진 팝업은 여기서 닫으면 안 된다. 닫아버리면 소진을 감지할 근거가 사라진다.
+   */
+  async function clearDrawResultPopup() {
+    for (let i = 0; i < 3; i++) {
+      if (isDailyDrawExhausted()) return false;
+      if (!document.querySelector(SEL.rewardPopup)) return true;
+
+      const closed = await closeVisiblePopup();
+      if (!closed) break;
+
+      await delay(350);
+    }
+
+    return !document.querySelector(SEL.rewardPopup);
+  }
+
+  /** 결과를 끝내 확인 못한 회차의 화면 상태를 남긴다 (원인 규명용) */
+  function dumpDrawFailure(drawNo, before, cost) {
+    const popup = document.querySelector(SEL.rewardPopup);
+
+    const record = {
+      drawNo,
+      before: {
+        hasPopup: Boolean(before.node),
+        text: before.text,
+        flake: before.flake,
+      },
+      after: {
+        hasPopup: Boolean(popup),
+        sameNode: Boolean(popup) && popup === before.node,
+        text: popup ? normalize(popup.innerText) : '',
+        flake: getFlakeCount(),
+      },
+      repeatButton: Boolean(findRepeatDrawButton(cost)),
+      initialButton: Boolean(findInitialDrawButton(cost)),
+      exhausted: isDailyDrawExhausted(),
+      bodyTail: normalize(document.body?.innerText || '').slice(-400),
+    };
+
+    DIAG.draw.push(record);
+    console.log('[stove-auto][diag] 뽑기 결과 미확인', record);
+  }
+
   /** 뽑기 단계를 마무리하고 다음 단계로 넘긴다. (성공·스킵·중단 모두 이 경로) */
   async function finishDrawPhase({ cost, completed, exhausted, stopReason, gained = 0 }) {
     const endFlake = getFlakeCount();
@@ -1577,15 +1710,24 @@
     let exhausted = false;
     let stopReason = '';
     let gained = 0;
+    let unverified = 0;
 
     for (let drawNo = 1; drawNo <= CFG.DRAW_COUNT; drawNo++) {
-      const isFirst = drawNo === 1;
+      // 이전 회차 팝업을 치워 '팝업 없음' 기준선을 만든다.
+      // 판정이 '부재 → 등장' 이라는 내용 무관 신호가 되어야
+      // 같은 보상이 연속으로 나와도 오판하지 않는다.
+      await clearDrawResultPopup();
 
+      if (isDailyDrawExhausted()) {
+        exhausted = true;
+        break;
+      }
+
+      // 팝업을 닫으면 '한번 더' 대신 처음 뽑기 버튼으로 돌아가는 화면도 있어
+      // 두 버튼을 항상 함께 본다.
       const button = await waitFor(
-        () =>
-          isDailyDrawExhausted() ||
-          (isFirst ? findInitialDrawButton(cost) : findRepeatDrawButton(cost)),
-        isFirst ? 12000 : 8000,
+        () => findRepeatDrawButton(cost) || findInitialDrawButton(cost),
+        drawNo === 1 ? 12000 : 10000,
         200
       );
 
@@ -1594,29 +1736,19 @@
         break;
       }
 
-      if (!button) {
-        stopReason = isFirst
-          ? `"${cost.toLocaleString()} 뽑기" 버튼을 찾지 못했습니다.`
-          : `${drawNo - 1}회차 후 "한번 더" 버튼이 나타나지 않았습니다.`;
+      if (!button || typeof button.click !== 'function') {
+        stopReason = `${drawNo}회차 뽑기 버튼을 찾지 못했습니다.`;
         break;
       }
 
-      let result = null;
+      const before = drawSignature();
 
-      for (let attempt = 0; attempt <= CFG.DRAW_RETRY_PER_ROUND; attempt++) {
-        const before = drawSignature();
-        const target = isFirst
-          ? findInitialDrawButton(cost) || button
-          : findRepeatDrawButton(cost) || button;
+      // 클릭은 회차당 정확히 1회. 재클릭은 뽑기를 한 번 더 소모시키므로 하지 않는다.
+      button.click();
 
-        if (!target || typeof target.click !== 'function') break;
+      let result = await waitForDrawResult(before);
 
-        target.click();
-
-        result = await waitForDrawResult(before);
-        if (result.ok) break;
-
-        // 결과가 안 잡히면 먼저 "소진"인지부터 본다. (오류로 오인하면 안 됨)
+      if (!result.ok) {
         if (isDailyDrawExhausted()) {
           exhausted = true;
           break;
@@ -1627,18 +1759,34 @@
           break;
         }
 
-        // 결과 팝업이 앞을 가려 클릭이 먹지 않는 경우가 있어 한 번 닫고 재시도한다.
-        logStatus(`⚠️ ${drawNo}회차 결과 확인 실패 — 재시도 ${attempt + 1}/${CFG.DRAW_RETRY_PER_ROUND}`);
-
-        await closeVisiblePopup();
-        await delay(random(900, 1400));
+        logStatus(`⌛ ${drawNo}회차 결과가 늦습니다 — 재클릭 없이 조금 더 기다립니다.`);
+        result = await waitForDrawResult(before, CFG.DRAW_GRACE_TIMEOUT);
       }
 
-      if (exhausted || stopReason) break;
+      if (!result.ok) {
+        if (isDailyDrawExhausted()) {
+          exhausted = true;
+          break;
+        }
 
-      if (!result?.ok) {
-        stopReason = `${drawNo}회차 뽑기 결과를 확인하지 못했습니다. 중복 소모를 막기 위해 중단합니다.`;
-        break;
+        if (hasInsufficientFlakeMessage()) {
+          stopReason = '플레이크가 부족해 뽑기를 중단합니다.';
+          break;
+        }
+
+        unverified++;
+        dumpDrawFailure(drawNo, before, cost);
+
+        if (unverified > CFG.DRAW_UNVERIFIED_LIMIT) {
+          stopReason = `${drawNo}회차까지 결과 확인 실패가 ${unverified}회 누적되어 중단합니다.`;
+          break;
+        }
+
+        // 클릭을 1회만 했으므로 중복 소모는 없다. 여기서 멈출 이유가 없다.
+        logStatus(
+          `⚠️ ${drawNo}회차 결과를 확인하지 못했지만 클릭은 1회뿐이라 계속 진행합니다. ` +
+            `(누적 ${unverified}/${CFG.DRAW_UNVERIFIED_LIMIT})`
+        );
       }
 
       completed = drawNo;
@@ -1944,31 +2092,56 @@
     navigate(getMain().rewardUrl || REWARD_URL, 'missions_start');
   }
 
+  /** 같은 탭에서 재시도가 겹쳐 도는 것을 막는 플래그 */
+  let dailyRetryRunning = false;
+
   async function runDailyRetry(shop) {
+    if (dailyRetryRunning) return;
+
     const item = cleanupOldRetries()[shop.code];
 
     if (!item || !item.inProgress || item.date !== kstDateKey()) return;
+
+    dailyRetryRunning = true;
 
     toast(`🔁 ${shop.label}\n오늘의 아이템 받기만 재시도합니다.`, 8000);
 
     await dailyShopLoaded();
 
-    const result = await claimTodayItem(shop, true);
+    const result = await claimTodayItem(shop, true).catch(error => {
+      logStatus(`⚠️ ${shop.label}: 재시도 중 오류 — ${error?.message || error}`);
+      return { status: 'error' };
+    });
+
+    // inProgress 를 못 풀면 그 항목은 오늘 내내 실행 대상에서 빠지거나(inProgress 필터)
+    // 반대로 계속 재실행된다. 성공·실패와 무관하게 반드시 푼다.
     const updated = getRetries();
 
     if (updated[shop.code]) {
       updated[shop.code].inProgress = false;
+      updated[shop.code].startedAt = 0;
       setRetries(updated);
     }
+
+    dailyRetryRunning = false;
 
     if (['done', 'already', 'none'].includes(result.status)) {
       toast(`✅ ${shop.label}: 오늘의 아이템 재시도 종료`, 7000);
     }
 
-    if (item.returnUrl && item.returnUrl !== location.href) {
+    // 대상 페이지 자신을 returnUrl 로 갖고 있으면 재시도가 끝나자마자
+    // 같은 페이지로 다시 튕겨 무한 새로고침이 된다.
+    const back = item.returnUrl;
+    const sameShop =
+      back && DAILY_SHOPS.some(entry => back.includes(`/dailyshop/${entry.code}`));
+
+    if (back && back !== location.href && !sameShop) {
       await delay(900);
-      location.href = item.returnUrl;
+      location.href = back;
+      return;
     }
+
+    armRetryTimer();
   }
 
   // ===========================================================================
@@ -2010,6 +2183,36 @@
     if (text === squash(MISSION_BUTTON.seeAchievement)) return 'see_achievement';
 
     return 'other';
+  }
+
+  /**
+   * 섹션 안 버튼의 실제 문구와 분류 결과를 그대로 찍는다.
+   * '왜 안 눌렸는가'는 화면 문구를 봐야만 확정된다 — 추측 대신 이 값을 본다.
+   */
+  function dumpSectionButtons(kind, label, section) {
+    if (!section) {
+      const record = { label, found: false, buttons: [] };
+      DIAG[kind].push(record);
+      console.log(`[stove-auto][diag] ${label}: 섹션을 찾지 못함`);
+      return record;
+    }
+
+    const buttons = [...section.querySelectorAll('button')].map((btn, index) => ({
+      index,
+      text: normalize(btn.innerText),
+      squashed: squash(btn.innerText),
+      kind: classifyMissionButton(btn),
+      disabled: btn.disabled,
+      visible: isVisible(btn),
+      className: btn.className,
+    }));
+
+    const record = { label, found: true, buttons };
+
+    DIAG[kind].push(record);
+    console.log(`[stove-auto][diag] ${label}: 버튼 ${buttons.length}개`, buttons);
+
+    return record;
   }
 
   /** 지금 누를 수 있는 수령 버튼 하나 (데일리·위클리·설문·인기글 모두 포함) */
@@ -2100,28 +2303,41 @@
   }
 
   async function collectPopular() {
-    const section = popularSection();
-    if (!section) return 0;
-
     let count = 0;
 
-    // 공백 표기가 페이지마다 달라 squash 로 비교한다.
-    // '...받기 완료' 처럼 이미 수령한 버튼은 제외해야 하므로 끝이 '받기' 인 것만 고른다.
-    const buttons = [...section.querySelectorAll('button')].filter(btn => {
-      if (btn.disabled || !isVisible(btn)) return false;
+    // 버튼 목록을 한 번에 캡처해두면 안 된다.
+    // 한 개를 누르는 순간 Vue 가 리스트를 다시 그려 나머지는 detached 노드가 되고,
+    // 그 노드에 대한 click() 은 조용히 무시된다. 매번 새로 찾는다.
+    for (let i = 0; i < 10; i++) {
+      const section = popularSection();
 
-      const text = squash(btn.innerText);
-      return text === '받기' || /플레이크받기$/.test(text);
-    });
+      if (!section) break;
 
-    for (const button of buttons) {
-      if (!document.contains(button) || button.disabled) continue;
+      const button = [...section.querySelectorAll('button')].find(btn => {
+        if (btn.disabled || !isVisible(btn)) return false;
 
-      button.click();
+        const text = squash(btn.innerText);
+
+        if (/완료$/.test(text)) return false;
+
+        return text === '받기' || /플레이크받기$/.test(text);
+      });
+
+      if (!button) {
+        if (i === 0) dumpSectionButtons('popular', '인기 게시글(수령 버튼 없음)', section);
+        break;
+      }
+
+      await clickWithScroll(button);
       count++;
 
       logStatus(`🎁 인기 게시글 보상 수령 (${count})`);
+
+      // 보상 팝업이 남아 있으면 다음 '받기' 버튼 클릭이 오버레이에 막힌다.
+      // 0.5.0 에서 첫 한 개만 받히고 나머지가 누락되던 원인.
       await delay(1500);
+      await closeVisiblePopup();
+      await delay(400);
     }
 
     return count;
@@ -2153,11 +2369,15 @@
 
       logStatus(
         already
-          ? `☑️ 인기 게시글 미션: ${total}개 모두 이미 완료된 상태입니다.`
+          ? `☑️ 인기 게시글 미션: ${total}개는 방문 처리된 상태입니다. 수령만 확인합니다.`
           : '⏭️ 인기 게시글 미션: 대상 게시글을 찾지 못했습니다.'
       );
 
-      return 0;
+      if (!already) dumpSectionButtons('popular', '인기 게시글(대상 없음)', popularSection());
+
+      // 방문은 끝났는데 수령만 안 된 상태가 있다. 여기서 return 0 으로 빠지면
+      // 그 보상은 영영 못 받는다. 수령은 항상 한 번 시도한다.
+      return collectPopular();
     }
 
     logStatus(`📰 인기 게시글 ${posts.length}/3개 자동 방문`);
@@ -2243,18 +2463,63 @@
    * 선택지는 무작위로 고른다 (항상 1번만 찍어 집계를 왜곡하지 않기 위함).
    * 수령 버튼은 이후 collectAllAvailableRewards 가 일괄 처리한다.
    */
+  /**
+   * 설문 보상을 실제로 수령한다.
+   *
+   * 사이트는 투표를 마친 뒤에도 버튼 문구를 '설문 참여하고 N 플레이크 받기' 로
+   * 유지하는 화면이 있다. 이 문구는 classifyMissionButton 이 'join_survey' 로 분류하고
+   * findClaimableRewardButton 은 'receive' 만 고르므로, 일괄 수령에서 통째로 빠진다.
+   * → 설문 섹션에 한해 join_survey 도 수령 후보로 본다.
+   */
+  async function claimSurveyReward() {
+    for (let i = 0; i < 3; i++) {
+      const section = surveySection();
+
+      if (!section) return i;
+
+      const button = [...section.querySelectorAll('button')].find(btn => {
+        if (btn.disabled || !isVisible(btn)) return false;
+
+        const kind = classifyMissionButton(btn);
+        return kind === 'receive' || kind === 'join_survey';
+      });
+
+      if (!button) {
+        if (i === 0) dumpSectionButtons('survey', '설문(수령 버튼 없음)', section);
+        return i;
+      }
+
+      await clickWithScroll(button);
+      logStatus(`🎁 설문조사 보상 수령 시도 (${i + 1})`);
+
+      await delay(1600);
+      await closeVisiblePopup();
+      await delay(400);
+    }
+
+    return 3;
+  }
+
   async function runSurvey() {
     const section = surveySection();
 
     if (!section) {
       patchProgress({ survey: 'none' });
       logStatus('⏭️ 설문조사 섹션이 없습니다.');
+
+      // 제목은 있는데 섹션 판정만 실패한 건지 구분할 근거를 남긴다.
+      dumpSectionButtons('survey', '설문(섹션 미검출)', findLeafByText(SURVEY_HEADING)?.parentElement || null);
+
       return 'none';
     }
 
     if (surveyAlreadyVoted(section)) {
       patchProgress({ survey: 'already' });
-      logStatus('☑️ 설문조사는 이미 참여한 상태입니다.');
+      logStatus('☑️ 설문조사는 이미 참여한 상태입니다. 수령 여부만 확인합니다.');
+
+      // 투표는 했는데 수령만 안 된 상태가 실제로 있다.
+      await claimSurveyReward();
+
       return 'already';
     }
 
@@ -2273,6 +2538,12 @@
     if (!choices.length) {
       patchProgress({ survey: 'none' });
       logStatus('⏭️ 설문조사 선택지를 찾지 못했습니다.');
+
+      dumpSectionButtons('survey', '설문(선택지 미검출)', surveySection() || section);
+
+      // 선택지를 못 찾아도 수령 버튼은 이미 활성일 수 있다.
+      await claimSurveyReward();
+
       return 'none';
     }
 
@@ -2284,6 +2555,11 @@
 
     await delay(1800);
     await closeVisiblePopup();
+    await delay(600);
+
+    // 투표 직후 수령 버튼이 열린다. 일괄 수령(collectAllAvailableRewards)은
+    // 'N 플레이크 받기' 형태만 잡으므로 여기서 직접 한 번 더 처리한다.
+    await claimSurveyReward();
 
     patchProgress({ survey: 'done' });
     return 'done';
@@ -2308,6 +2584,63 @@
     return LOUNGE_MISSIONS.filter(title =>
       ['todo', 'claimable'].includes(missionStateOf(title).state)
     );
+  }
+
+  /**
+   * 방문 미션 버튼은 사이트가 window.open 으로 새 탭을 연다.
+   * 그 핸들은 사이트 쪽에만 있어서 스크립트가 닫을 수 없고, 탭이 그대로 쌓인다.
+   *
+   * 클릭하는 순간에만 window.open 을 감싸서, 우리가 GM_openInTab 으로 대신 열고
+   * 그 핸들을 쥔다. 체류 시간이 지나면 우리가 연 탭만 정확히 닫는다.
+   */
+  async function clickVisitMissionAndClose(button, waitMs = CFG.VISIT_WAIT) {
+    const opened = [];
+    const nativeOpen = window.open;
+
+    window.open = function (url, name, features) {
+      const href = String(url || '');
+
+      if (href) {
+        try {
+          const handle = GM_openInTab(href, { active: false, insert: true, setParent: true });
+
+          if (handle) {
+            opened.push(handle);
+
+            // 사이트 코드가 반환값을 만지는 경우가 있어 최소한의 형태는 돌려준다.
+            return { closed: false, close() {}, focus() {} };
+          }
+        } catch (_) {
+          /* GM_openInTab 실패 시 아래 원래 동작으로 */
+        }
+      }
+
+      const native = nativeOpen.call(window, url, name, features);
+
+      if (native) opened.push(native);
+
+      return native;
+    };
+
+    try {
+      button.click();
+      await delay(waitMs);
+    } finally {
+      window.open = nativeOpen;
+    }
+
+    let closed = 0;
+
+    for (const handle of opened) {
+      try {
+        handle?.close?.();
+        closed++;
+      } catch (_) {
+        /* 이미 닫힌 경우 무시 */
+      }
+    }
+
+    return { opened: opened.length, closed };
   }
 
   async function runRewardMissions() {
@@ -2336,13 +2669,18 @@
       const { state, label } = missionStateOf(title);
 
       if (state === 'todo') {
-        missionStateOf(title).button?.click();
+        const target = missionStateOf(title).button;
+        const tabs = target ? await clickVisitMissionAndClose(target) : { opened: 0, closed: 0 };
+
         visitCount++;
 
         patchProgress({ visitMissionCount: visitCount, visitAlready });
-        logStatus(`🔗 방문 미션: ${title}`);
-
-        await delay(CFG.VISIT_WAIT);
+        logStatus(
+          `🔗 방문 미션: ${title}` +
+            (tabs.opened
+              ? ` (새 탭 ${tabs.closed}/${tabs.opened}개 자동 닫음)`
+              : ' (새 탭 핸들을 잡지 못해 닫지 못했습니다)')
+        );
       } else if (state === 'claimable' || state === 'already') {
         visitCount++;
         if (state === 'already') visitAlready++;
@@ -2911,19 +3249,20 @@
   // ===========================================================================
 
   async function bootIdlePage() {
-    armRetryTimer();
-
-    // Daily Shop 페이지에서 재시도가 진행 중이면 그것부터 처리
+    // 순서가 중요하다. armRetryTimer() 를 먼저 부르면 이미 지난 예약이
+    // 0ms 로 발사되어, 아래 runDailyRetry 가 시작하기도 전에 페이지를
+    // 새로고침시켜 버린다. (0.5.0 데일리샵 먹통의 실제 진행 경로)
     if (location.hostname === HOST.dailyshop) {
       const shop = currentDailyShop();
-      const retryItem = shop ? getRetries()[shop.code] : null;
+      const retryItem = shop ? cleanupOldRetries()[shop.code] : null;
 
       if (shop && retryItem?.inProgress && retryItem.date === kstDateKey()) {
         await runDailyRetry(shop);
-        armRetryTimer();
         return;
       }
     }
+
+    armRetryTimer();
 
     if (findDueRetry()) launchDueRetry();
   }
@@ -2955,9 +3294,54 @@
     running = false;
   });
 
+  /**
+   * 콘솔 진단 API.
+   * 코드만으로는 확정할 수 없는 구간(인기글/설문 버튼 문구, 뽑기 결과 미확인)의
+   * 실제 화면 상태를 그대로 꺼내기 위한 것이다.
+   *
+   *   __stoveDiag.popular()  인기 게시글 섹션 버튼 전수
+   *   __stoveDiag.survey()   설문 섹션 버튼 전수
+   *   __stoveDiag.state()    저장된 자동화 상태 / 재시도 예약
+   *   __stoveDiag.dump()     위 전부를 JSON 문자열로 (복사해서 공유)
+   *   __stoveDiag.resetRetry()  재시도 예약 전체 삭제 (먹통 응급 복구)
+   */
+  // Tampermonkey 는 스크립트를 샌드박스에서 돌린다. window 에만 붙이면
+  // DevTools 콘솔(페이지 컨텍스트)에서 __stoveDiag 가 undefined 로 보인다.
+  const diagHost = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+
+  diagHost.__stoveDiag = window.__stoveDiag = {
+    popular: () => dumpSectionButtons('popular', '인기 게시글(수동 조회)', popularSection()),
+    survey: () => dumpSectionButtons('survey', '설문(수동 조회)', surveySection()),
+    state: () => ({ version: VERSION, url: location.href, main: getMain(), retries: getRetries() }),
+    raw: () => DIAG,
+    dump() {
+      return JSON.stringify(
+        { state: this.state(), popular: this.popular(), survey: this.survey(), collected: DIAG },
+        null,
+        2
+      );
+    },
+    resetRetry() {
+      clearTimeout(window.__stoveRetryTimer);
+      setRetries({});
+      logStatus('🧹 재시도 예약을 모두 지웠습니다.');
+      return true;
+    },
+  };
+
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('STOVE 자동화 강제 초기화', () => {
       stopAutomation('메뉴에서 강제 초기화했습니다.');
+    });
+
+    GM_registerMenuCommand('STOVE 재시도 예약 초기화', () => {
+      window.__stoveDiag.resetRetry();
+      renderStatusPanel();
+    });
+
+    GM_registerMenuCommand('STOVE 진단 덤프 (콘솔)', () => {
+      console.log(window.__stoveDiag.dump());
+      toast('🩺 진단 덤프를 콘솔(F12)에 출력했습니다.', 7000);
     });
 
     GM_registerMenuCommand('STOVE 로그 지우기', () => {
