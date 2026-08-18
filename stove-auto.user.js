@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STOVE 플레이크 전체 자동화 + 상태 패널
 // @namespace    https://github.com/supsupsupsupsu/stove-auto
-// @version      0.7.0
+// @version      0.7.1
 // @description  캡슐 뽑기 → 캡슐 누적 보상 → Daily Shop → 미션 → 인기 게시글 → 라운지 → 보상 수령을 자동 처리합니다. (뽑기 성공 검증 / 단계 워치독 / 자동 복구 포함)
 // @homepageURL  https://github.com/supsupsupsupsu/stove-auto
 // @supportURL   https://github.com/supsupsupsupsu/stove-auto/issues
@@ -44,10 +44,13 @@
  *            (뽑기 API 호출 관찰 + 팝업 DOM 변형 카운터 + 잔액 + 팝업 등장)
  *            중단 조건도 누적 3회 → 연속 3회로 완화했다.
  *
- *        [추가] '인기 게시글 보고 플레이크 받기!' 수령 로직 재작성.
- *          카드 단위로 링크·버튼·완료 여부를 함께 읽고, 방문 → 수령 → 반영 대기 →
- *          미완료 글 재방문까지 라운드로 돌린다. 방문 탭은 도우미가 스크롤하며
- *          체류한 뒤 스스로 닫아 '읽음' 인정률을 올린다.
+ *        [추가] '인기 게시글 보고 플레이크 받기!' 수령 로직.
+ *          이 미션에는 '받기' 버튼이 없다. 카드에 "클릭 시 100 플레이크" 라고만
+ *          적혀 있고, 보상은 리워드 페이지에서 그 카드를 직접 눌렀을 때 지급된다.
+ *          새 탭으로 글을 열어 읽는 것만으로는 아무 일도 일어나지 않는다.
+ *          → 카드를 리워드 페이지에서 직접 클릭한다. 클릭의 기본 동작(이동)은 막아
+ *            리워드 페이지가 게시글로 넘어가지 않게 하고, 우리가 연 탭만 체류 후 닫는다.
+ *            지급은 잔액 변화로 확인하고 오늘 원장에 기록해 같은 글을 두 번 누르지 않는다.
  *
  * 0.6.0  [수정] Daily Shop 재시도가 페이지를 무한 새로고침시켜 먹통이 되던 문제.
  *          지난 예약을 armRetryTimer 가 0ms 로 발사 → launchDueRetry 가 같은 주소를
@@ -116,6 +119,9 @@
     // 새 탭에서 실행되는 "방문 도우미" 에게 넘기는 지시.
     // 탭 사이에 공유되어야 하므로 GM storage 를 쓴다.
     VISIT: '__stove_visit_task_s1',
+
+    // 오늘 이미 누른 인기 게시글. 클릭 보상은 하루 한 번뿐이라 원장이 필요하다.
+    POPULAR: '__stove_popular_claimed_s1',
   };
 
   const CFG = {
@@ -160,16 +166,11 @@
     // 이 창이 닫힌 뒤에 열린 탭은 사용자가 직접 연 것으로 보고 건드리지 않는다.
     VISIT_TAB_GRACE_MS: 15 * 1000,
 
-    // 인기 게시글 1편당 체류 시간 (짧으면 '읽음'으로 인정되지 않는다)
-    POPULAR_VISIT_WAIT: 7000,
+    // 인기 게시글 카드를 누른 뒤, 지급이 반영되고 새 탭이 뜰 때까지 기다리는 시간
+    POPULAR_CLICK_WAIT: 5000,
 
-    // 수령 버튼이 열릴 때까지 재확인하는 라운드 수와 간격.
-    // 방문 직후 곧바로 열리지 않고 몇 초 뒤 반영되는 경우가 잦다.
-    POPULAR_CLAIM_ROUNDS: 4,
-    POPULAR_CLAIM_DELAY: 3500,
-
-    // 마지막 라운드 전에 미완료 글을 한 번 더 방문할지 여부
-    POPULAR_REVISIT: true,
+    // 클릭으로 열린 게시글 탭의 체류 시간 (도우미가 스크롤하다 스스로 닫는다)
+    POPULAR_VISIT_WAIT: 5000,
 
     // 워치독: 이 시간 동안 상태 갱신이 없으면 멈춘 것으로 판단
     STALL_TIMEOUT_MS: 90 * 1000,
@@ -2534,8 +2535,45 @@
     return total;
   }
 
+  /**
+   * 카드에 붙는 안내 문구. squash(공백 제거) 기준으로 본다.
+   * 예) "클릭 시 100 플레이크" → "클릭시100플레이크"
+   * 이 문구가 남아 있으면 아직 안 받은 카드다.
+   */
+  const POPULAR_HINT_RE = /클릭시[\d,]*플레이크/;
+
+  const POPULAR_HEADING = '인기 게시글 보고 플레이크 받기!';
+
+  /** 오늘 이미 누른 게시글 원장 (KST 자정에 자동 초기화) */
+  function getPopularClaimed() {
+    const value = GM_getValue(KEY.POPULAR, null);
+    const today = kstDateKey();
+
+    if (!value || typeof value !== 'object' || value.date !== today) {
+      return { date: today, hrefs: [] };
+    }
+
+    return { date: today, hrefs: Array.isArray(value.hrefs) ? value.hrefs : [] };
+  }
+
+  function rememberPopularClaimed(href) {
+    const ledger = getPopularClaimed();
+
+    if (!ledger.hrefs.includes(href)) ledger.hrefs.push(href);
+
+    GM_setValue(KEY.POPULAR, ledger);
+  }
+
+  /** 로그용 제목. 카드 텍스트가 길어 앞부분만 쓴다. */
+  function popularTitleOf(entry) {
+    const text = normalize(entry.anchor?.innerText || entry.card?.innerText || '')
+      .replace(/^클릭 시 [\d,]+ 플레이크\s*/, '');
+
+    return text.slice(0, 30) || entry.href;
+  }
+
   function popularSection() {
-    const heading = findLeafByText('인기 게시글 보고 플레이크 받기!');
+    const heading = findLeafByText(POPULAR_HEADING);
     if (!heading) return null;
 
     let section = heading;
@@ -2583,16 +2621,23 @@
    * 자기 상태로 착각한다.
    */
   function popularCardOf(anchor, section) {
-    let node = anchor.parentElement;
+    let card = anchor;
+    let node = anchor;
 
-    for (let i = 0; i < 8 && node && node !== section; i++) {
-      if (node.querySelectorAll(SEL.popularAnchor).length > 1) return null;
-      if (node.querySelector('button')) return node;
+    // 이 글의 앵커만 품는 가장 바깥 노드까지 올라간다.
+    // (버튼이 아니라 '클릭 시 N 플레이크' 안내 문구가 카드에 붙어 있으므로
+    //  버튼 존재를 기준으로 멈추면 안내 문구를 놓친다)
+    for (let i = 0; i < 10; i++) {
+      const parent = node.parentElement;
 
-      node = node.parentElement;
+      if (!parent || parent === section) break;
+      if (parent.querySelectorAll(SEL.popularAnchor).length > 1) break;
+
+      card = parent;
+      node = parent;
     }
 
-    return null;
+    return card;
   }
 
   /** 지금 누를 수 있는 인기 게시글 수령 버튼 하나 */
@@ -2612,12 +2657,22 @@
 
   /**
    * 인기 게시글 카드 전수.
-   * 링크 · 카드 · 수령 가능 여부 · 완료 여부를 한 번에 읽어 한 곳에서 판단한다.
+   *
+   * 이 미션에는 '받기' 버튼이 없다. 카드마다 "클릭 시 100 플레이크" 라고만 적혀 있고,
+   * 보상은 리워드 페이지에서 그 카드를 직접 눌렀을 때 지급된다.
+   * 그래서 새 탭으로 글을 열어 읽는 것만으로는 아무 일도 일어나지 않는다.
+   * (0.7.0 이 0/3 으로 끝나던 이유)
+   *
+   * 판정 근거
+   *   안내 문구 있음 + 오늘 안 눌렀음 → 눌러야 함
+   *   안내 문구 없음                  → 사이트가 지운 것 = 이미 받음
+   *   오늘 눌렀음                     → 이미 받음 (원장 기준)
    */
   function popularCards() {
     const section = popularSection();
     if (!section) return [];
 
+    const claimed = new Set(getPopularClaimed().hrefs || []);
     const seen = new Set();
     const cards = [];
 
@@ -2628,20 +2683,32 @@
       seen.add(href);
 
       const card = popularCardOf(anchor, section);
+      const text = squash(card.innerText);
 
-      // 카드를 특정할 수 있으면 그 안의 버튼이 가장 정확한 근거다.
-      // 못 하면 예전 휴리스틱(주변 텍스트)으로 물러선다.
-      const complete = card
-        ? [...card.querySelectorAll('button')].some(button =>
-            /완료$/.test(squash(button.innerText))
-          )
-        : isPopularComplete(anchor, section);
+      const hasHint = POPULAR_HINT_RE.test(text);
+      const buttonDone = [...card.querySelectorAll('button')].some(button =>
+        /완료$/.test(squash(button.innerText))
+      );
+
+      const alreadyClaimed = claimed.has(href);
+
+      // 버튼형 UI 가 섞여 나오는 계정도 있다. 그건 클릭이 아니라 버튼으로 받아야 하므로
+      // 두 경로를 섞지 않고 따로 센다.
+      const button = popularClaimableButton(card);
+
+      const needsClick = hasHint && !alreadyClaimed && !buttonDone;
+      const complete = !needsClick && !button;
 
       cards.push({
         href,
+        anchor,
         card,
+        hasHint,
+        alreadyClaimed,
+        button,
+        needsClick,
         complete,
-        claimable: Boolean(card && popularClaimableButton(card)),
+        claimable: needsClick,
       });
     }
 
@@ -2650,6 +2717,47 @@
 
   function pendingPopularPosts() {
     return popularCards().filter(card => !card.complete);
+  }
+
+  /**
+   * 인기 게시글 카드 한 장을 리워드 페이지에서 직접 클릭한다.
+   *
+   * 클릭 기본 동작(이동)은 반드시 막아야 한다. 그대로 두면 리워드 페이지가
+   * 게시글로 넘어가 버려 자동화 전체가 끊긴다. 대신 우리가 새 탭으로 열고,
+   * 잠깐 체류시킨 뒤 그 탭만 닫는다. 사이트의 클릭 핸들러는 그대로 실행된다.
+   */
+  async function clickPopularCard(entry) {
+    const before = getFlakeCount();
+    const url = location.href;
+
+    const capture = captureNewTabs({ allAnchors: true });
+
+    openVisitWindow('popular', [entry.href], CFG.POPULAR_CLICK_WAIT + CFG.VISIT_TAB_GRACE_MS);
+
+    try {
+      await clickWithScroll(entry.anchor, 400);
+      await delay(CFG.POPULAR_CLICK_WAIT);
+    } finally {
+      capture.stop();
+    }
+
+    capture.closeAll();
+
+    // 클릭 보상 팝업이 남아 있으면 다음 카드 클릭이 오버레이에 막힌다.
+    await closeVisiblePopup();
+    await delay(500);
+
+    if (location.href !== url) {
+      logStatus('⚠️ 인기 게시글 클릭으로 페이지가 이동했습니다. 이 미션은 중단합니다.');
+      return { moved: true, gained: null };
+    }
+
+    const after = getFlakeCount();
+
+    const gained =
+      before != null && after != null && after > before ? after - before : null;
+
+    return { moved: false, gained };
   }
 
   async function collectPopular() {
@@ -2699,11 +2807,14 @@
   /**
    * 인기 게시글 미션 전체.
    *
-   *   1. 아직 완료되지 않은 글을 새 탭으로 방문한다.
-   *      그 탭에서는 방문 도우미가 스크롤하며 체류한 뒤 스스로 닫는다.
-   *      (백그라운드 탭을 4초 열어두기만 해서는 '읽음' 이 인정되지 않는 경우가 있다)
-   *   2. 수령한다. 방문이 서버에 반영되기까지 몇 초 걸리므로 라운드로 재확인한다.
-   *   3. 그래도 남으면 그 글만 다시, 더 길게 방문한다.
+   * 이 미션은 "보고 받는" 게 아니라 "누르면 주는" 미션이다.
+   * 카드에 적힌 문구가 그대로 규칙이다 — "클릭 시 100 플레이크".
+   * 그래서 새 탭으로 글을 열어 읽어봐야 아무 일도 일어나지 않는다.
+   * 리워드 페이지에서 그 카드를 직접 눌러야 한다.
+   *
+   *   1. 카드를 하나씩 리워드 페이지에서 직접 클릭한다. (이동은 막고, 새 탭은 닫는다)
+   *   2. 잔액 변화로 지급을 확인하고 오늘 원장에 기록한다.
+   *   3. 버튼형 UI 가 섞여 나오는 계정을 위해 마지막에 버튼 수령도 한 번 훑는다.
    */
   async function runPopular() {
     const section = popularSection();
@@ -2715,14 +2826,13 @@
       dumpSectionButtons(
         'popular',
         '인기 게시글(섹션 미검출)',
-        findLeafByText('인기 게시글 보고 플레이크 받기!')?.parentElement || null
+        findLeafByText(POPULAR_HEADING)?.parentElement || null
       );
 
       return 0;
     }
 
-    const cards = popularCards();
-    const total = cards.length;
+    const total = popularCards().length;
 
     patchProgress({ popularTotal: total, popularState: 'running' });
 
@@ -2732,55 +2842,43 @@
 
       dumpSectionButtons('popular', '인기 게시글(대상 없음)', section);
 
-      // 링크를 못 읽어도 수령 버튼은 열려 있을 수 있다. 수령은 항상 한 번 시도한다.
       return collectPopular();
     }
 
-    // --- 1) 방문 ---
-    // 이미 수령 가능한 글은 방문할 이유가 없다.
-    const toVisit = cards.filter(card => !card.complete && !card.claimable).map(card => card.href);
-
-    if (toVisit.length) {
-      logStatus(`📰 인기 게시글 ${toVisit.length}/${total}개 방문을 시작합니다.`);
-
-      await visitPopularPosts(toVisit, CFG.POPULAR_VISIT_WAIT);
-      await refreshMissionList();
-    } else {
-      logStatus(`☑️ 인기 게시글: 방문이 필요한 글이 없습니다. 수령만 진행합니다.`);
-    }
-
-    // --- 2) 수령 (+ 3) 미완료 글 재방문) ---
     let claimed = 0;
 
-    for (let round = 1; round <= CFG.POPULAR_CLAIM_ROUNDS; round++) {
-      claimed += await collectPopular();
+    // 한 장을 누르면 Vue 가 목록을 다시 그린다. 잡아둔 노드는 detached 가 되므로
+    // 매 회 href 기준으로 새로 찾는다.
+    for (let step = 0; step < total + 2; step++) {
+      const next = popularCards().find(card => card.claimable);
 
-      const left = pendingPopularPosts();
+      if (!next) break;
 
-      if (!left.length) break;
+      const index = claimed + 1;
 
-      const lastRound = round === CFG.POPULAR_CLAIM_ROUNDS;
+      logStatus(`🖱️ 인기 게시글 ${index}/${total} 클릭: ${popularTitleOf(next)}`);
 
-      if (lastRound) {
-        logStatus(`⚠️ 인기 게시글 ${left.length}개는 끝내 수령하지 못했습니다.`);
-        dumpSectionButtons('popular', '인기 게시글(수령 실패)', popularSection());
-        break;
-      }
+      const result = await clickPopularCard(next);
 
-      // 마지막 라운드 직전, 체류가 짧아 인정되지 않은 글을 더 길게 다시 방문한다.
-      if (CFG.POPULAR_REVISIT && round === CFG.POPULAR_CLAIM_ROUNDS - 1) {
-        logStatus(`🔁 인기 게시글 ${left.length}개가 아직 수령 대기 — 더 길게 재방문합니다.`);
-        await visitPopularPosts(left.map(card => card.href), CFG.POPULAR_VISIT_WAIT + 4000);
-      } else {
-        logStatus(
-          `⏳ 인기 게시글 수령 반영 대기 ${round}/${CFG.POPULAR_CLAIM_ROUNDS} (남은 ${left.length}개)`
-        );
+      if (result.moved) break;
 
-        await delay(CFG.POPULAR_CLAIM_DELAY);
-      }
+      // 클릭은 하루 한 번만 유효하다. 지급 확인 여부와 무관하게 기록해
+      // 같은 글을 반복해서 누르지 않도록 한다.
+      rememberPopularClaimed(next.href);
+      claimed++;
 
-      await refreshMissionList();
+      logStatus(
+        result.gained
+          ? `🎁 인기 게시글 보상 +${result.gained.toLocaleString()} (${claimed}/${total})`
+          : `🎁 인기 게시글 클릭 완료 (${claimed}/${total}) — 잔액 변화는 확인하지 못했습니다.`
+      );
+
+      await delay(1200);
     }
+
+    // 버튼형 UI 가 섞여 나오는 계정 대비. 없으면 조용히 지나간다.
+    await refreshMissionList();
+    claimed += await collectPopular();
 
     const finalCards = popularCards();
     const finalTotal = finalCards.length || total;
@@ -2795,8 +2893,8 @@
 
     logStatus(
       claimed
-        ? `✅ 인기 게시글 보상 ${claimed}개 수령 (완료 ${done}/${finalTotal})`
-        : `⏭️ 인기 게시글: 이번 실행에서 새로 수령한 보상은 없습니다. (완료 ${done}/${finalTotal})`
+        ? `✅ 인기 게시글 ${claimed}개 처리 (완료 ${done}/${finalTotal})`
+        : `⏭️ 인기 게시글: 오늘 처리할 카드가 없습니다. (완료 ${done}/${finalTotal})`
     );
 
     return claimed;
@@ -2984,7 +3082,7 @@
    *   2) <a target="_blank"> 클릭을 캡처 단계에서 가로챈다. (window.open 을 안 쓰는 경우)
    *   3) 그래도 새면, 열린 탭 쪽의 방문 도우미가 스스로 닫는다. (runHelperPage)
    */
-  function captureNewTabs() {
+  function captureNewTabs({ allAnchors = false } = {}) {
     const handles = [];
     const restores = [];
 
@@ -3056,17 +3154,24 @@
       }
     }
 
-    // 기본 동작(새 탭)만 막고 전파는 그대로 둔다.
-    // 사이트의 미션 처리 핸들러는 그대로 실행되어야 방문이 인정된다.
+    // 기본 동작(이동/새 탭)만 막고 전파는 그대로 둔다.
+    // 사이트의 미션 처리 핸들러는 반드시 그대로 실행되어야 클릭이 인정된다.
+    //
+    // allAnchors 는 인기 게시글용이다. 그 카드는 target 이 _blank 가 아닐 수 있는데,
+    // 그대로 두면 클릭이 리워드 페이지 자체를 게시글로 이동시켜 자동화가 끊긴다.
     const onAnchorClick = event => {
       const anchor = event.target?.closest?.('a[href]');
 
-      if (!anchor || anchor.target !== '_blank') return;
+      if (!anchor) return;
+      if (!allAnchors && anchor.target !== '_blank') return;
 
       const href = anchor.href;
 
       if (!href || href.startsWith('javascript:')) return;
-      if (openViaGM(href)) event.preventDefault();
+
+      // 이동은 무조건 막는다. 탭을 못 열어도 페이지가 넘어가는 것보다는 낫다.
+      event.preventDefault();
+      openViaGM(href);
     };
 
     document.addEventListener('click', onAnchorClick, true);
@@ -3613,45 +3718,6 @@
     closeSelfTab();
   }
 
-  /** 인기 게시글을 하나씩 새 탭으로 열어 체류시키고 닫는다. */
-  async function visitPopularPosts(hrefs, waitMs) {
-    if (!hrefs.length) return 0;
-
-    // 도우미 유효 창은 전체 방문에 걸친다 (탭이 늦게 뜨는 경우까지 감안).
-    openVisitWindow('popular', hrefs, hrefs.length * (waitMs + 3000) + CFG.VISIT_TAB_GRACE_MS);
-
-    let visited = 0;
-
-    for (let i = 0; i < hrefs.length; i++) {
-      let handle = null;
-
-      try {
-        handle = GM_openInTab(hrefs[i], { active: false, insert: true, setParent: true });
-      } catch (error) {
-        logStatus(`⚠️ 인기 게시글 새 탭 열기 실패: ${error?.message || error}`);
-        continue;
-      }
-
-      logStatus(`🔗 인기 게시글 ${i + 1}/${hrefs.length} 방문 중 (${Math.round(waitMs / 1000)}초 체류)`);
-
-      await delay(waitMs);
-
-      // 도우미가 이미 닫았을 수도 있다. 그래도 한 번 더 확실히 닫는다.
-      try {
-        handle?.close?.();
-      } catch (_) {
-        /* 이미 닫힌 경우 무시 */
-      }
-
-      visited++;
-      await delay(700);
-    }
-
-    closeVisitWindow();
-
-    return visited;
-  }
-
   /**
    * phase 별 담당 페이지와 실행 함수.
    * 담당 호스트가 아니면 알아서 해당 페이지로 이동한다.
@@ -3951,7 +4017,15 @@
   diagHost.__stoveDiag = window.__stoveDiag = {
     popular: () => dumpSectionButtons('popular', '인기 게시글(수동 조회)', popularSection()),
     survey: () => dumpSectionButtons('survey', '설문(수동 조회)', surveySection()),
-    cards: () => popularCards().map(({ href, complete, claimable }) => ({ href, complete, claimable })),
+    cards: () =>
+      popularCards().map(({ href, hasHint, alreadyClaimed, needsClick, button, complete }) => ({
+        href,
+        hasHint,
+        alreadyClaimed,
+        needsClick,
+        hasButton: Boolean(button),
+        complete,
+      })),
     probe: () => ({
       drawApiHint: PROBE.drawApiHint,
       popupAppears: PROBE.popupAppears,
