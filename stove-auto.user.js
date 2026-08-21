@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         STOVE 플레이크 전체 자동화 + 상태 패널
 // @namespace    https://github.com/supsupsupsupsu/stove-auto
-// @version      0.7.1
+// @version      0.7.2
 // @description  캡슐 뽑기 → 캡슐 누적 보상 → Daily Shop → 미션 → 인기 게시글 → 라운지 → 보상 수령을 자동 처리합니다. (뽑기 성공 검증 / 단계 워치독 / 자동 복구 포함)
 // @homepageURL  https://github.com/supsupsupsupsu/stove-auto
 // @supportURL   https://github.com/supsupsupsupsu/stove-auto/issues
@@ -27,6 +27,20 @@
 
 /* =============================================================================
  * 변경 이력
+ *
+ * 0.7.2  [수정] 라운지 "글 [등록] 자동 처리에 실패했습니다." 로 매일 멈추던 문제.
+ *          2026-08 라운지 개편으로 글쓰기 패널이 접힌 상태(.sc-feed-editor.is-collapsed)
+ *          에서도 제목 textarea 를 미리 렌더링하게 바뀌었다. ensureLoungeEditor 는
+ *          제목 입력창의 "존재"만 보고 이미 열렸다고 판단해 패널을 펼치지 않았고,
+ *          그 상태의 본문 에디터(.fr-element.fr-view)는 visibility:hidden / height 0
+ *          이라 execCommand('insertText') 가 통째로 무시됐다. 본문이 비니
+ *          [등록] 버튼은 계속 is-disabled 로 남고 waitAndClick 이 10초 뒤 실패했다.
+ *          → 펼침 여부(is-collapsed 해제 + 본문 에디터가 실제로 보임)를 기준으로
+ *            판정하고, 로그인 상태에서는 별도 [글쓰기] 버튼이 없으므로 접힌 패널
+ *            영역 자체를 눌러 펼친다.
+ *        [보강] 본문 삽입 실패 시 DOM 직접 주입으로 폴백, [등록] 버튼을 텍스트로도
+ *          한 번 더 탐색, is-disabled/aria-disabled 까지 비활성으로 인식,
+ *          실패 시 패널·본문·버튼 상태를 로그에 남긴다.
  *
  * 0.7.0  [수정] 방문 미션이 연 탭 3개(365일 특가 / MY홈 / 스토브 메인)가 안 닫히던 문제.
  *          Tampermonkey 는 스크립트를 샌드박스에서 돌린다. 0.6.0 은 샌드박스 쪽
@@ -197,6 +211,13 @@
     drawButtonText: 'span.button-draw-hover-text',
     repeatButtonText: 'span.block.whitespace-nowrap',
     popularAnchor: 'a[href*="page.onstove.com"]',
+    // 라운지 글쓰기 패널. 2026-08 개편 이후 "접힌 상태(is-collapsed)"에서도
+    // 제목 textarea 가 DOM 에 미리 렌더링된다. 존재 여부만 보면 안 되고
+    // 반드시 펼쳐졌는지(=본문 에디터가 실제로 보이는지)까지 확인해야 한다.
+    loungeEditorRoot: '.sc-feed-editor',
+    loungeEditorContent: '.sc-feed-editor-content',
+    loungeWriteButton: 'button.sc-feed-editor-write-button',
+    loungeFormBody: '.sc-feed-editor-form-body',
     loungeTitle: 'textarea.sc-feed-editor-form-title',
     loungeBody: 'div.fr-element.fr-view',
     loungeSubmit: 'button.sc-feed-editor-submit-button',
@@ -3328,8 +3349,10 @@
   }
 
   function setEditor(el, text) {
-    el.innerHTML = '<p><br></p>';
+    el.click();
     el.focus();
+
+    el.innerHTML = '<p><br></p>';
 
     const range = document.createRange();
 
@@ -3341,23 +3364,146 @@
     selection.removeAllRanges();
     selection.addRange(range);
 
-    document.execCommand('insertText', false, text);
+    let inserted = false;
+
+    try {
+      inserted = document.execCommand('insertText', false, text);
+    } catch (error) {
+      console.warn('[stove] execCommand(insertText) 실패', error);
+    }
+
+    // 에디터가 숨겨져 있거나 포커스를 못 잡으면 execCommand 가 조용히 실패한다.
+    // 그 상태로 넘어가면 본문이 비어 등록 버튼이 영원히 비활성으로 남으므로
+    // 직접 DOM 을 채우고 프레임워크가 감지하도록 이벤트를 다시 쏜다.
+    // innerText 는 숨겨진 요소에서 항상 '' 을 돌려주므로 textContent 로 판정한다.
+    if (!inserted || !el.textContent.trim()) {
+      el.innerHTML = `<p>${escapeHtml(text)}</p>`;
+    }
 
     el.dispatchEvent(new Event('input', { bubbles: true }));
+    el.dispatchEvent(new Event('change', { bubbles: true }));
+
+    return !!el.textContent.trim();
   }
 
-  async function ensureLoungeEditor() {
-    const existing = document.querySelector(SEL.loungeTitle);
-    if (existing) return existing;
+  /** disabled 속성뿐 아니라 클래스/aria 로만 비활성 표시하는 버튼까지 걸러낸다. */
+  function isEnabled(el) {
+    if (!el || el.disabled) return false;
+    if (el.getAttribute('aria-disabled') === 'true') return false;
+    if (el.classList.contains('is-disabled') || el.classList.contains('disabled')) return false;
 
-    const writeButton = allButtons().find(btn => btn.innerText.trim().includes('글쓰기'));
+    return true;
+  }
 
-    if (writeButton) {
-      writeButton.click();
+  /**
+   * 글쓰기 폼 안쪽의 "입력 가능한" 본문 에디터.
+   *
+   * 접혀 있을 때는 높이 0 + visibility:hidden 이라 확실히 배제한다.
+   * 다만 펼친 뒤에도 Froala 가 placeholder 상태(.fr-wrapper.show-placeholder)에서
+   * visibility:hidden 을 유지하는 경우가 있어, visibility 만으로 판정하면
+   * 멀쩡한 에디터를 못 찾는다. 이때도 innerHTML 주입 + input 이벤트로는
+   * 정상 등록되므로 "높이가 잡혔는지"를 2차 기준으로 쓴다.
+   */
+  function loungeBodyEl() {
+    const root = document.querySelector(SEL.loungeEditorRoot);
+    if (root && root.classList.contains('is-collapsed')) return null;
+
+    const scopes = [document.querySelector(SEL.loungeFormBody), root, document].filter(Boolean);
+
+    for (const scope of scopes) {
+      const list = [...scope.querySelectorAll(SEL.loungeBody)];
+
+      const visible = list.find(isVisible);
+      if (visible) return visible;
+
+      const sized = list.find(
+        el => document.contains(el) && el.getBoundingClientRect().height > 0
+      );
+      if (sized) return sized;
+    }
+
+    return null;
+  }
+
+  /** 글쓰기 [등록] 버튼. 클래스가 바뀌어도 텍스트로 한 번 더 찾는다. */
+  function loungeSubmitEl() {
+    const root = document.querySelector(SEL.loungeEditorRoot) || document;
+
+    const direct =
+      root.querySelector(SEL.loungeSubmit) || document.querySelector(SEL.loungeSubmit);
+
+    if (direct) return direct;
+
+    return (
+      [...root.querySelectorAll('button')].find(
+        btn => isVisible(btn) && squash(btn.innerText) === '등록'
+      ) || null
+    );
+  }
+
+  /**
+   * 글쓰기 패널이 "펼쳐져서 입력 가능한" 상태일 때만 제목 입력창을 돌려준다.
+   * 접힌 상태에서는 제목 textarea 가 보여도 본문(Froala)이 visibility:hidden 이라
+   * 입력이 통째로 무시된다.
+   */
+  function loungeEditorOpen() {
+    const root = document.querySelector(SEL.loungeEditorRoot);
+    if (root && root.classList.contains('is-collapsed')) return null;
+
+    const title = document.querySelector(SEL.loungeTitle);
+    if (!title || !isVisible(title)) return null;
+
+    return loungeBodyEl() ? title : null;
+  }
+
+  function describeLoungeEditor() {
+    const root = document.querySelector(SEL.loungeEditorRoot);
+    const title = document.querySelector(SEL.loungeTitle);
+    const body = loungeBodyEl();
+    const submit = loungeSubmitEl();
+
+    return [
+      `panel=${root ? root.className : '없음'}`,
+      `title=${title ? (isVisible(title) ? '보임' : '숨김') : '없음'}`,
+      `body=${body ? `입력가능(${body.textContent.trim().length}자)` : '숨김/없음'}`,
+      `submit=${submit ? (isEnabled(submit) ? '활성' : '비활성') : '없음'}`,
+    ].join(', ');
+  }
+
+  /** 접힌 글쓰기 패널을 펼친다. */
+  async function openLoungeEditor() {
+    const root = document.querySelector(SEL.loungeEditorRoot);
+
+    // 로그인 상태에서는 별도 [글쓰기] 버튼이 없고, 접힌 패널 영역 자체가 트리거다.
+    const trigger =
+      document.querySelector(SEL.loungeWriteButton) ||
+      allButtons().find(btn => isVisible(btn) && btn.innerText.trim().includes('글쓰기')) ||
+      root?.querySelector(SEL.loungeEditorContent) ||
+      root;
+
+    if (trigger) {
+      await clickWithScroll(trigger, 200);
       await delay(1200);
     }
 
-    return waitFor(() => document.querySelector(SEL.loungeTitle), 8000, 200);
+    return loungeEditorOpen();
+  }
+
+  async function ensureLoungeEditor() {
+    const opened = loungeEditorOpen();
+    if (opened) return opened;
+
+    // 패널이 뜨기 전이면 잠깐 기다렸다가 펼치기를 시도한다.
+    await waitFor(() => document.querySelector(SEL.loungeEditorRoot), 8000, 250);
+
+    for (let i = 0; i < 3; i++) {
+      const editor = await openLoungeEditor();
+      if (editor) return editor;
+
+      await delay(800);
+    }
+
+    return waitFor(loungeEditorOpen, 6000, 250);
   }
 
   function findCreatedPostNow(title) {
@@ -3375,27 +3521,48 @@
   }
 
   async function fillPost(titleText) {
-    const title = await ensureLoungeEditor();
+    const opened = await ensureLoungeEditor();
 
-    if (!title) throw new Error('라운지 글쓰기 제목 입력창을 찾지 못했습니다.');
-
-    setTextarea(title, titleText);
-
-    const body = await waitFor(() => document.querySelector(SEL.loungeBody), 10000, 200);
-
-    if (!body) throw new Error('라운지 본문 입력창을 찾지 못했습니다.');
-
-    const submit = () => document.querySelector(SEL.loungeSubmit);
-
-    for (let i = 0; i < 3; i++) {
-      setEditor(body, BODY_TEXT);
-      await delay(500);
-
-      const button = submit();
-      if (button && !button.disabled) break;
+    if (!opened) {
+      logStatus(`🔎 글쓰기 진단: ${describeLoungeEditor()}`);
+      throw new Error('라운지 글쓰기 입력창을 펼치지 못했습니다.');
     }
 
+    const body = await waitFor(loungeBodyEl, 10000, 250);
+
+    if (!body) {
+      logStatus(`🔎 글쓰기 진단: ${describeLoungeEditor()}`);
+      throw new Error('라운지 본문 입력창을 찾지 못했습니다.');
+    }
+
+    // 제목/본문은 매 시도마다 다시 조회한다. 패널이 펼쳐지는 과정에서
+    // Vue 가 요소를 통째로 갈아끼우면 예전 참조는 유령이 된다.
+    for (let i = 0; i < 4; i++) {
+      const titleEl = document.querySelector(SEL.loungeTitle);
+      const bodyEl = loungeBodyEl();
+
+      if (!titleEl || !bodyEl) {
+        await ensureLoungeEditor();
+        await delay(600);
+        continue;
+      }
+
+      setTextarea(titleEl, titleText);
+      setEditor(bodyEl, BODY_TEXT);
+
+      await delay(600);
+
+      const button = loungeSubmitEl();
+      if (button && isEnabled(button)) break;
+    }
+
+    const submit = () => {
+      const button = loungeSubmitEl();
+      return button && isEnabled(button) ? button : null;
+    };
+
     if (!(await waitAndClick(submit, '글 [등록]'))) {
+      logStatus(`🔎 글쓰기 진단: ${describeLoungeEditor()}`);
       throw new Error('글 [등록] 자동 처리에 실패했습니다.');
     }
 
@@ -3440,11 +3607,14 @@
     setEditor(editor.ed, COMMENT_TEXT);
     await delay(500);
 
-    const commentOK = await waitAndClick(
-      () =>
-        document.contains(editor.sub) ? editor.sub : post.querySelector(SEL.commentSubmit),
-      '댓글 [등록]'
-    );
+    const commentOK = await waitAndClick(() => {
+      const button = document.contains(editor.sub)
+        ? editor.sub
+        : post.querySelector(SEL.commentSubmit);
+
+      // 댓글 [등록] 도 글 [등록] 과 같이 클래스로만 비활성을 표시한다.
+      return button && isEnabled(button) ? button : null;
+    }, '댓글 [등록]');
 
     if (!commentOK) throw new Error('댓글 [등록] 자동 처리에 실패했습니다.');
 
